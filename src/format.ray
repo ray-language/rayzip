@@ -3,6 +3,7 @@
 //! out of a buffer; neither touches files.
 
 import std/collections/bytesbuilder;
+import std/inflate;
 import le;
 
 pub const LOCAL_SIG: int = 0x04034B50;
@@ -44,6 +45,8 @@ pub const MAX16: int = 0xFFFF;
 const EXTRA_ZIP64: int = 0x0001;
 
 const EXTRA_TIME: int = 0x5455;
+
+const EXTRA_UNICODE_PATH: int = 0x7075;
 
 /// "Version made by": high byte 3 = Unix (external attributes hold the mode), low byte the spec
 /// version (4.5, the first with ZIP64).
@@ -315,7 +318,11 @@ pub fn central_entries(cd: bytes, count: int) -> Result<[Entry], string> {
             return Result.Err("corrupt central directory (entry ${out.len() + 1})");
         }
         let name_bytes = cd.sub_bytes(p + CENTRAL_LEN, p + CENTRAL_LEN + name_len);
-        let name = text_of(name_bytes);
+        let name = if ((flags & FLAG_UTF8) != 0) {
+            from_utf8(name_bytes).unwrap_or(cp437(name_bytes))
+        } else {
+            text_of(name_bytes)
+        };
         let unix = (made_by >> 8) == 3;
         let mode = if (unix) { external >> 16 } else { 0 };
         let e = Entry {
@@ -330,17 +337,17 @@ pub fn central_entries(cd: bytes, count: int) -> Result<[Entry], string> {
             dos_date: le.u16_at(cd, p + 14),
             unix_time: Option.None,
             mode: mode,
-            is_dir: name.ends_with("/") || (external & 0x10) == 0x10
+            is_dir: name.ends_with("/") || name.ends_with("\\") || (external & 0x10) == 0x10
         };
         let extra_at = p + CENTRAL_LEN + name_len;
-        read_extras(e, cd.sub_bytes(extra_at, extra_at + extra_len))?;
+        read_extras(e, name_bytes, cd.sub_bytes(extra_at, extra_at + extra_len))?;
         out.push(e);
         p = end;
     }
     Result.Ok(out)
 }
 
-fn read_extras(e: Entry, ex: bytes) -> Result<int, string> {
+fn read_extras(e: Entry, raw_name: bytes, ex: bytes) -> Result<int, string> {
     var p = 0;
     while (p + 4 <= ex.len()) {
         let id = le.u16_at(ex, p);
@@ -374,6 +381,14 @@ fn read_extras(e: Entry, ex: bytes) -> Result<int, string> {
             }
         } else if (id == EXTRA_TIME && len >= 5 && (ex[body_at] & 1) == 1) {
             e.unix_time = Option.Some(le.u32_at(ex, body_at + 1));
+        } else if (id == EXTRA_UNICODE_PATH && len > 5 && ex[body_at] == 1) {
+            // Info-ZIP's UTF-8 copy of the name; valid only while the CRC of the header's name
+            // matches (a tool that renamed the entry without updating it leaves a stale copy).
+            if (inflate.crc32(raw_name) == le.u32_at(ex, body_at + 1)) {
+                if let Result.Ok(n) = from_utf8(ex.sub_bytes(body_at + 5, body_at + len)) {
+                    e.name = n;
+                }
+            }
         }
         p = body_at + len;
     }
@@ -389,17 +404,27 @@ pub fn data_offset(local: bytes, header_at: int) -> Result<int, string> {
     Result.Ok(header_at + LOCAL_LEN + le.u16_at(local, 26) + le.u16_at(local, 28))
 }
 
-/// A name as text: UTF-8 when it is valid, otherwise each octet as its Latin-1 character (an
-/// approximation of the CP437 that old tools wrote).
+/// Octets 0x80–0xFF of code page 437, the charset of names without the UTF-8 flag.
+const CP437_HIGH: string = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ";
+
+/// A name or comment as text: UTF-8 when it is valid, otherwise code page 437 (what the spec
+/// says for names without the UTF-8 flag, and what Windows' tar and Compress-Archive write).
+/// Valid UTF-8 wins even without the flag: Info-ZIP on Unix writes UTF-8 and does not set it.
 pub fn text_of(b: bytes) -> string {
     match (from_utf8(b)) {
         Result.Ok(s) => s,
-        Result.Err(_) => {
-            var s = "";
-            for o in b {
-                s = s + to_string(char_from_code(o).unwrap_or('?'));
-            }
-            s
-        },
+        Result.Err(_) => cp437(b),
     }
+}
+
+pub fn cp437(b: bytes) -> string {
+    let out: [string] = [];
+    for o in b {
+        if (o < 128) {
+            out.push(to_string(char_from_code(o).unwrap_or('?')));
+        } else {
+            out.push(to_string(CP437_HIGH[o - 128]));
+        }
+    }
+    join(out, "")
 }

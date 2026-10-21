@@ -20,9 +20,12 @@ gzip/gunzip · `-q` silencioso.
 
 ## Qué hace
 
-- **Crea** archivos que leen `unzip`, `zipinfo` y `std/zip`: deflate o stored, lo que ocupe menos
-  (lo ya comprimido va tal cual). Lleva el modo Unix (los permisos sobreviven), la fecha en hora local
-  (con el paquete `tz`) y el campo extendido `UT` en UTC, y marca los nombres UTF-8.
+- **Crea** archivos que leen `unzip`, `zipinfo`, `std/zip`, `tar.exe` y `Expand-Archive`: deflate o
+  stored, lo que ocupe menos (lo ya comprimido va tal cual). Lleva el modo Unix (los permisos
+  sobreviven), la fecha en hora local (con el paquete `tz`; en Windows, UTC, ver #200) y el campo
+  extendido `UT` en UTC, y marca los nombres UTF-8. Los nombres van sin letra de unidad.
+- **Lee los nombres** en UTF-8 o, si no lo son, en CP437 (lo que escriben `tar.exe` y
+  `Compress-Archive` de Windows), con el campo Unicode Path de Info-ZIP si viene.
 - **Comprime en paralelo**: `-j N` fibras leen y deflan archivos por delante del escritor, que los
   pone en orden. El resultado es idéntico byte a byte con cualquier `-j`.
 - **ZIP64**: más de 65 535 entradas, o tamaños y posiciones de más de 4 GiB.
@@ -69,7 +72,7 @@ vienen de lo que falta (ver hallazgos):
 
 ```bash
 make build         # ./rayzip, binario nativo
-make test          # 36 tests en la VM (los de compatibilidad usan zip, unzip y gzip si están)
+make test          # 38 tests en la VM (los de compatibilidad usan zip/unzip/gzip, o en Windows tar.exe y PowerShell)
 make test-native   # los mismos, compilados
 make bench         # contra zip/unzip/gzip en un corpus generado
 ```
@@ -98,18 +101,18 @@ escrito en raylang (hallazgo #189).
 
 | Qué | Estado |
 |---|---|
-| Crear, listar, probar, extraer; gzip y gunzip | **36 tests** en VM y nativo (raylang 1.27.65), con `std/zip` de oráculo |
+| Crear, listar, probar, extraer; gzip y gunzip | **38 tests** en VM y nativo (raylang 1.27.65) en macOS, Linux y Windows 11 ARM64, con `std/zip` de oráculo |
 | Compatibilidad | `unzip -t`/`unzip` leen lo que escribe (contenido, modos, ZIP64 de 66 000 entradas); rayzip lee lo de `zip -r`, `zip -ry` (symlinks) y `zip -r0`; `gzip -t`/`-d` leen sus miembros y rayzip los `.gz` de `gzip` |
 | Seguridad al extraer | zip-slip (`..`, absolutos, unidades, `\`), symlinks fuera, symlinks plantados, bombas, setuid, archivos truncados: tests en `tests/safety_test.ray` |
 | ZIP64 por tamaño (> 4 GiB) | codificado y decodificado en tests de formato; **sin probar** con un archivo real de más de 4 GiB |
-| Windows | **sin probar** (el CI corre en Linux y macOS) |
+| Windows | **verificado** (21 oct 2026, VM UTM con Windows 11 ARM64): la suite en VM y nativo; `tar.exe` y `Expand-Archive` extraen lo que escribe rayzip y rayzip lo de `tar -a` y `Compress-Archive`. Symlinks con `\\`; sin permisos (Windows no tiene `chmod`, #199); hora DOS en UTC (#200). **El binario nativo no compila en Windows arm64** mientras `worker_count()` no compile allí (#197): para probarlo se usó `-j 4` fijo |
 
 Pendiente para una v2: guardar symlinks al crear (falta `readlink`), restaurar fechas al extraer
 (falta fijar `mtime`), comprimir con memoria acotada si llega un deflate por streaming, y cifrado.
 
 ## Hallazgos de dogfood
 
-En `findings/open/rayzip-1.27.65.md` del directorio de las apps (#188–#196):
+En `findings/open/rayzip-1.27.65.md` del directorio de las apps (#188–#200):
 
 1. **#188 [B]** `inflate.gunzip` da «CRC32 mismatch (corrupt gzip)» con un gzip válido de varios
    miembros (el de rayzip, o dos `gzip_compress` concatenados).
@@ -122,7 +125,14 @@ En `findings/open/rayzip-1.27.65.md` del directorio de las apps (#188–#196):
 7. **#194 [E]** `std/fs` no puede fijar la fecha de modificación.
 8. **#195 [E]** `std/fs` no tiene `readlink`: no se pueden guardar symlinks.
 9. **#196 [D]** `llms.txt` lista `std/huffman` sin decir que es solo HPACK.
+10. **#197 [B]** `worker_count()`/`worker_id()` no compilan en nativo para Windows arm64.
+11. **#198 [B]** `fs.symlink` en Windows con `/` en el destino crea un enlace que no se sigue.
+12. **#199 [D]** `fs.chmod` es `Err` en Windows y `Stat.mode` vale 0; la doc no lo dice.
+13. **#200 [E]** No hay hora local en Windows: ni `tz` ni `std/time`.
 
 Lo que salió bien: `bytesbuilder` para construir registros, las fibras para comprimir en paralelo
 (4,5× con 8), `tz` para la hora DOS local, `fs.seek` sobre un handle de escritura para parchear la
 CRC, y `fs.is_within_real` para los symlinks plantados. Los 36 tests pasaron en nativo a la primera.
+Windows destapó dos fallos de rayzip, ya corregidos: la letra de unidad entraba en los nombres de las
+entradas con rutas absolutas (`C:/…`, que el propio rayzip se negaba a extraer), y los nombres CP437
+de `tar.exe`/`Compress-Archive` se leían como Latin-1 (`ñ` salía `¤`).

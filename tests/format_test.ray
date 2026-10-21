@@ -1,6 +1,7 @@
 // The ZIP records: what the encoders write, the decoders read back, and the DOS clock.
 
 import std/collections/bytesbuilder;
+import std/inflate;
 import dostime;
 import format;
 import le;
@@ -100,9 +101,44 @@ fn not_a_zip() {
 }
 
 @test
-fn names_that_are_not_utf8_read_as_latin1() {
-    assert_eq(format.text_of(b"caf\xe9"), "café");
+fn names_that_are_not_utf8_read_as_cp437() {
+    // What Windows' tar.exe and Compress-Archive write for "ñ.txt" and "Ä€".
+    assert_eq(format.text_of(b"\xa4.txt"), "ñ.txt");
+    assert_eq(format.text_of(b"\x8e\xee"), "Äε");
+    assert_eq(format.text_of(b"\xff"), " ");
     assert_eq(format.text_of("ñ".to_bytes()), "ñ");
+}
+
+/// A central header whose name is `raw` (no UTF-8 flag) with an Info-ZIP Unicode Path field.
+fn with_unicode_path(raw: bytes, crc_of: bytes, utf8: string) -> bytes {
+    let field = bytesbuilder.new();
+    le.put_u16(field, 0x7075);
+    le.put_u16(field, 5 + utf8.to_bytes().len());
+    le.put_u8(field, 1);
+    le.put_u32(field, inflate.crc32(crc_of));
+    bytesbuilder.push(field, utf8.to_bytes());
+    let ex = bytesbuilder.build(field);
+    let e = entry("x", 1, 1, 0);
+    e.unix_time = Option.None;
+    let cd = format.central_header(e);
+    // Swap the one-octet name "x" for `raw` and append the field.
+    let b = bytesbuilder.new();
+    bytesbuilder.push(b, cd.sub_bytes(0, 28));
+    le.put_u16(b, raw.len());
+    le.put_u16(b, ex.len());
+    bytesbuilder.push(b, cd.sub_bytes(32, 46));
+    bytesbuilder.push(b, raw);
+    bytesbuilder.push(b, ex);
+    bytesbuilder.build(b)
+}
+
+@test
+fn the_unicode_path_field_names_the_entry_while_its_crc_matches() {
+    let raw = b"\xa4.txt";
+    let good = format.central_entries(with_unicode_path(raw, raw, "ñandú.txt"), 1).unwrap();
+    assert_eq(good[0].name, "ñandú.txt");
+    let stale = format.central_entries(with_unicode_path(raw, b"other", "ñandú.txt"), 1).unwrap();
+    assert_eq(stale[0].name, "ñ.txt");
 }
 
 @test
@@ -121,6 +157,12 @@ fn dos_time_round_trips_at_two_second_resolution() {
 
 @test
 fn dos_time_is_local_time() {
+    // The tz package reads the system's zoneinfo database, which Windows does not have.
+    if (platform() == "windows") {
+        assert(dostime.zone("Europe/Madrid").is_err());
+        eprint("skipped: no zoneinfo database on Windows");
+        return;
+    }
     let madrid = dostime.zone("Europe/Madrid").unwrap();
     // 2026-07-01 12:00:00 UTC is 14:00 in Madrid (CEST, +2).
     let ms = 1782907200000;

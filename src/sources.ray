@@ -15,12 +15,13 @@ pub struct Source {
     perm: int,
 }
 
-/// The archive name of a path as typed: no leading `/` or `./`, no `.` or `..` components,
-/// `\` read as `/` (what `zip` does).
+/// The archive name of a path as typed: no drive letter, no leading `/` or `./`, no `.` or `..`
+/// components, `\` read as `/` (what `zip` does).
 pub fn archive_name(path: string) -> string {
     let parts: [string] = [];
     for p in path.replace("\\", "/").split("/") {
-        if (p != "" && p != "." && p != "..") {
+        let drive = parts.len() == 0 && p.len() == 2 && p[1] == ':';
+        if (p != "" && p != "." && p != ".." && !drive) {
             parts.push(p);
         }
     }

@@ -39,7 +39,10 @@ fn tree() -> string {
     fs.write_file("${root}/in/rows.csv", join(rows, "")).unwrap();
     fs.write_file("${root}/in/sub/ñ.txt", "ñ\n").unwrap();
     fs.write_file("${root}/in/empty", "").unwrap();
-    fs.chmod("${root}/in/rows.csv", 0o600).unwrap();
+    // Windows has no permission bits (`fs.chmod` is an `Err` there).
+    if (platform() != "windows") {
+        fs.chmod("${root}/in/rows.csv", 0o600).unwrap();
+    }
     root
 }
 
@@ -140,5 +143,92 @@ fn gzip_and_rayzip_read_each_other() {
     sh("gzip -c '${root}/in/rows.csv' > '${root}/rows.csv.gz'");
     gz.decompress("${root}/rows.csv.gz", "${root}/rows.back").unwrap();
     sh("cmp '${root}/rows.back' '${root}/in/rows.csv'");
+    fs.remove_all(root).unwrap();
+}
+
+/// Runs a program (no shell) and fails the test if it does not exit 0.
+fn run(program: string, argv: [string]) {
+    let o = process.run(program, argv).unwrap();
+    match (o.exit) {
+        process.Exit.Code(0) => { },
+        _ => panic(
+            "${program} ${join(argv, " ")} failed: ${from_utf8(o.stdout).unwrap_or("")}${from_utf8(o.stderr).unwrap_or("")}"
+        ),
+    }
+}
+
+/// Whether two directory trees hold the same files with the same bytes.
+fn same_tree(a: string, b: string) {
+    let names = fs.list_dir(a).unwrap();
+    assert_eq(names, fs.list_dir(b).unwrap());
+    for n in names {
+        if (fs.is_dir("${a}/${n}")) {
+            same_tree("${a}/${n}", "${b}/${n}");
+        } else {
+            assert_eq(
+                fs.read_file_bytes("${a}/${n}").unwrap(),
+                fs.read_file_bytes("${b}/${n}").unwrap()
+            );
+        }
+    }
+}
+
+fn read_and_test(path: string) {
+    let a = archive.open(path).unwrap();
+    assert_eq(extract.test(a, fn(n: string) { }).failed.len(), 0);
+    archive.close_archive(a);
+}
+
+/// Windows has no zip/unzip, but it has bsdtar (`tar.exe`, which reads and writes zip) and
+/// PowerShell's Compress-Archive / Expand-Archive (.NET's ZipArchive).
+@test
+fn the_windows_tools_and_rayzip_read_each_other() {
+    if (platform() != "windows") {
+        eprint("skipped: not Windows");
+        return;
+    }
+    let root = tree();
+    let list = sources.collect(["${root}/in"], "").unwrap();
+    let o = create.Options {
+        store_only: false,
+        deflate_limit: 1 << 30,
+        jobs: 2,
+        clock: dostime.system()
+    };
+    create.create("${root}/r.zip", list, o, fn(n: string) { }).unwrap();
+    let inner = sources.archive_name(root);
+    fs.mkdir("${root}/t").unwrap();
+    run("tar", ["-xf", "${root}/r.zip", "-C", "${root}/t"]);
+    same_tree("${root}/t/${inner}/in", "${root}/in");
+    run(
+        "powershell",
+        [
+            "-NoProfile",
+            "-Command",
+            "Expand-Archive -LiteralPath '${root}/r.zip' -DestinationPath '${root}/p'"
+        ]
+    );
+    same_tree("${root}/p/${inner}/in", "${root}/in");
+    // And the other way: archives written by .NET and by bsdtar.
+    run(
+        "powershell",
+        [
+            "-NoProfile",
+            "-Command",
+            "Compress-Archive -Path '${root}/in' -DestinationPath '${root}/ps.zip'"
+        ]
+    );
+    run("tar", ["-a", "-cf", "${root}/bsd.zip", "-C", root, "in"]);
+    for name in [
+        "ps.zip",
+        "bsd.zip"
+    ] {
+        read_and_test("${root}/${name}");
+        let a = archive.open("${root}/${name}").unwrap();
+        extract.extract(a, extract.Options { dest: "${root}/x-${name}", overwrite: false }, fn(n: string) { })
+            .unwrap();
+        archive.close_archive(a);
+        same_tree("${root}/x-${name}/in", "${root}/in");
+    }
     fs.remove_all(root).unwrap();
 }

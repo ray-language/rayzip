@@ -1,6 +1,7 @@
 # rayzip CI: every pull request and every push to master checks the formatting and runs the
 # test suite on the VM and as native binaries, with the raylang release pinned in ray.toml
-# (.github/actions/setup-ray). The interop tests use the runner's zip, unzip and gzip.
+# (.github/actions/setup-ray). The interop tests use the runner's zip, unzip and gzip, and on
+# Windows its tar.exe (bsdtar) and PowerShell's Compress-Archive / Expand-Archive.
 name: ci
 
 on:
@@ -49,8 +50,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: macos-14,      target: aarch64-apple-darwin }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: macos-14,       target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -61,9 +64,12 @@ jobs:
       - name: Fetch the dependencies
         run: ray fetch
       - name: Tools for the interop tests
+        if: runner.os != 'Windows'
         run: zip -v | head -2 && unzip -v | head -1 && gzip --version | head -1
       - name: Tests (VM)
+        shell: bash
         run: ray test
       # rayzip ships native: the suite also runs compiled.
       - name: Tests (native)
+        shell: bash
         run: ray test --native

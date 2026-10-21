@@ -158,6 +158,10 @@ fn an_existing_symlink_is_replaced_not_written_through() {
 
 @test
 fn setuid_bits_are_dropped() {
+    if (platform() == "windows") {
+        eprint("skipped: no permission bits on Windows");
+        return;
+    }
     let it = file("f", "x");
     it.mode = format.file_mode(0o4755);
     let (r, root) = try_extract([it]);

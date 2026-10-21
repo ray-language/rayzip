@@ -38,8 +38,15 @@ fn tree() -> string {
     fs.write_file_bytes("${root}/in/sub/noise.bin", noise(70000, 7)).unwrap();
     fs.write_file("${root}/in/empty", "").unwrap();
     fs.write_file("${root}/in/sub/deep/ñandú.txt", "ñandú\n").unwrap();
-    fs.chmod("${root}/in/a.txt", 0o640).unwrap();
+    if (unix()) {
+        fs.chmod("${root}/in/a.txt", 0o640).unwrap();
+    }
     root
+}
+
+/// Windows has no permission bits: `fs.chmod` is an `Err` and `fs.stat` reports mode 0.
+fn unix() -> bool {
+    platform() != "windows"
 }
 
 fn options(jobs: int) -> create.Options {
@@ -88,6 +95,7 @@ fn the_walk_is_sorted_and_names_are_relative() {
     );
     assert_eq(sources.archive_name("./x/../y//z"), "x/y/z");
     assert_eq(sources.archive_name("/abs/path"), "abs/path");
+    assert_eq(sources.archive_name("C:\\Users\\me\\x.txt"), "Users/me/x.txt");
     fs.remove_all(root).unwrap();
 }
 
@@ -117,7 +125,9 @@ fn check_archive(root: string, path: string) {
     let text = a.entries.filter(fn(e: format.Entry) -> bool { e.name.ends_with("a.txt") })[0];
     assert_eq(text.method, format.DEFLATED);
     assert(text.compressed * 10 < text.size);
-    assert_eq(format.permissions(text), 0o640);
+    if (unix()) {
+        assert_eq(format.permissions(text), 0o640);
+    }
     archive.close_archive(a);
 }
 
@@ -148,7 +158,9 @@ fn extraction_restores_contents_and_modes() {
     assert_eq(fs.read_file_bytes("${base}/sub/noise.bin").unwrap(), noise(70000, 7));
     assert_eq(fs.read_file("${base}/sub/deep/ñandú.txt").unwrap(), "ñandú\n");
     assert_eq(fs.read_file("${base}/empty").unwrap(), "");
-    assert_eq(fs.stat("${base}/a.txt").unwrap().mode & 0o777, 0o640);
+    if (unix()) {
+        assert_eq(fs.stat("${base}/a.txt").unwrap().mode & 0o777, 0o640);
+    }
     // A second extraction refuses to overwrite, unless asked.
     assert(extract.extract(a, extract.Options { dest: dest, overwrite: false }, quiet).is_err());
     assert(extract.extract(a, extract.Options { dest: dest, overwrite: true }, quiet).is_ok());
