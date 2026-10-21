@@ -1,0 +1,144 @@
+// Against the system's zip, unzip and gzip, when they are installed (a test without them
+// checks nothing and says so on stderr).
+
+import std/fs;
+import std/process;
+import archive;
+import create;
+import dostime;
+import extract;
+import gz;
+import sources;
+
+fn has(tool: string) -> bool {
+    match (process.run("sh", ["-c", "command -v ${tool}"])) {
+        Result.Ok(o) => match (o.exit) {
+            process.Exit.Code(0) => true,
+            _ => false,
+        },
+        Result.Err(_) => false,
+    }
+}
+
+fn sh(cmd: string) -> string {
+    let o = process.run("sh", ["-c", cmd]).unwrap();
+    let out = from_utf8(o.stdout).unwrap_or("");
+    match (o.exit) {
+        process.Exit.Code(0) => out,
+        _ => panic("'${cmd}' failed: ${out}${from_utf8(o.stderr).unwrap_or("")}"),
+    }
+}
+
+fn tree() -> string {
+    let root = fs.make_temp_dir("rayzip-interop").unwrap();
+    fs.mkdir("${root}/in/sub").unwrap();
+    let rows: [string] = [];
+    for i in 0..3000 {
+        rows.push("row ${i}, ${i * 31 % 1000}\n");
+    }
+    fs.write_file("${root}/in/rows.csv", join(rows, "")).unwrap();
+    fs.write_file("${root}/in/sub/ñ.txt", "ñ\n").unwrap();
+    fs.write_file("${root}/in/empty", "").unwrap();
+    fs.chmod("${root}/in/rows.csv", 0o600).unwrap();
+    root
+}
+
+@test
+fn unzip_reads_what_rayzip_writes() {
+    if (!has("unzip")) {
+        eprint("skipped: no unzip");
+        return;
+    }
+    let root = tree();
+    let list = sources.collect(["${root}/in"], "").unwrap();
+    let o = create.Options {
+        store_only: false,
+        deflate_limit: 1 << 30,
+        jobs: 2,
+        clock: dostime.system()
+    };
+    create.create("${root}/r.zip", list, o, fn(n: string) { }).unwrap();
+    sh("unzip -tq '${root}/r.zip'");
+    sh("mkdir '${root}/u' && cd '${root}/u' && unzip -q '${root}/r.zip'");
+    let base = "${root}/u/${sources.archive_name(root)}/in";
+    sh("diff -r '${base}' '${root}/in'");
+    assert_eq(fs.stat("${base}/rows.csv").unwrap().mode & 0o777, 0o600);
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn rayzip_reads_what_zip_writes() {
+    if (!has("zip")) {
+        eprint("skipped: no zip");
+        return;
+    }
+    let root = tree();
+    fs.symlink("rows.csv", "${root}/in/link").unwrap();
+    // -y stores the symlink as a link; -X leaves out the extra fields zip adds by default.
+    sh("cd '${root}' && zip -qry z.zip in && zip -qr0 s.zip in");
+    for name in ["z.zip", "s.zip"] {
+        let a = archive.open("${root}/${name}").unwrap();
+        let t = extract.test(a, fn(n: string) { });
+        assert_eq(t.failed.len(), 0);
+        archive.close_archive(a);
+    }
+    let a = archive.open("${root}/z.zip").unwrap();
+    extract.extract(a, extract.Options { dest: "${root}/x", overwrite: false }, fn(n: string) { })
+        .unwrap();
+    archive.close_archive(a);
+    sh("diff -r '${root}/x/in' '${root}/in'");
+    assert_eq(fs.stat("${root}/x/in/link").unwrap().kind, "symlink");
+    assert_eq(fs.stat("${root}/x/in/rows.csv").unwrap().mode & 0o777, 0o600);
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn unzip_lists_a_zip64_archive() {
+    if (!has("unzip")) {
+        eprint("skipped: no unzip");
+        return;
+    }
+    let root = fs.make_temp_dir("rayzip-interop").unwrap();
+    fs.write_file("${root}/one", "1").unwrap();
+    let list: [sources.Source] = [];
+    for i in 0..66000 {
+        list.push(
+            sources.Source {
+                path: "${root}/one",
+                name: "f${i}",
+                is_dir: false,
+                size: 1,
+                mtime_ms: 1760000000000,
+                perm: 0o644
+            }
+        );
+    }
+    let o = create.Options { store_only: true, deflate_limit: 1024, jobs: 1, clock: dostime.utc() };
+    create.create("${root}/many.zip", list, o, fn(n: string) { }).unwrap();
+    sh("unzip -tq '${root}/many.zip'");
+    let last = sh("unzip -l '${root}/many.zip' | tail -1");
+    assert(last.contains("66000 files"));
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn gzip_and_rayzip_read_each_other() {
+    if (!has("gzip")) {
+        eprint("skipped: no gzip");
+        return;
+    }
+    let root = tree();
+    // Three members of ours: gzip -d concatenates them.
+    let rows: [string] = [];
+    for i in 0..400000 {
+        rows.push(to_string(i));
+    }
+    let big = join(rows, "\n");
+    fs.write_file("${root}/big", big + big + big + big).unwrap();
+    gz.compress("${root}/big", "${root}/big.gz", 3).unwrap();
+    sh("gzip -t '${root}/big.gz' && gzip -dc '${root}/big.gz' | cmp - '${root}/big'");
+    sh("gzip -c '${root}/in/rows.csv' > '${root}/rows.csv.gz'");
+    gz.decompress("${root}/rows.csv.gz", "${root}/rows.back").unwrap();
+    sh("cmp '${root}/rows.back' '${root}/in/rows.csv'");
+    fs.remove_all(root).unwrap();
+}

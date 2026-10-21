@@ -1,0 +1,364 @@
+//! Writing an archive. Each file is read whole, summed and deflated in memory (`std/deflate`
+//! has no streaming compressor), by `jobs` worker fibers in parallel; the writer puts them in
+//! the archive in order. Files over `deflate_limit` are stored instead, streamed in chunks with
+//! the CRC patched into the local header afterwards, so memory stays bounded.
+
+import std/collections/bytesbuilder;
+import std/deflate;
+import std/fs;
+import std/inflate;
+import crc;
+import dostime;
+import format;
+import sources;
+from format import Entry;
+from sources import Source;
+
+pub struct Options {
+    store_only: bool,
+    /// Files bigger than this are stored, not deflated.
+    deflate_limit: int,
+    jobs: int,
+    clock: dostime.Clock,
+}
+
+pub struct Summary {
+    files: int,
+    dirs: int,
+    bytes_in: int,
+    bytes_out: int,
+}
+
+/// A file ready to write: its sum, method and the bytes that go into the archive.
+struct Packed {
+    index: int,
+    crc: int,
+    method: int,
+    /// The size read, which is what the CRC covers (the file may have changed since the walk).
+    size: int,
+    payload: bytes,
+    error: string,
+}
+
+struct Job {
+    index: int,
+    path: string,
+    store_only: bool,
+}
+
+const CHUNK: int = 1024 * 1024;
+
+fn pack(index: int, path: string, store_only: bool) -> Packed {
+    match (fs.read_file_bytes(path)) {
+        Result.Ok(data) => {
+            let sum = inflate.crc32(data);
+            if (store_only || data.len() == 0) {
+                return Packed {
+                    index: index,
+                    crc: sum,
+                    method: format.STORED,
+                    size: data.len(),
+                    payload: data,
+                    error: ""
+                };
+            }
+            let packed = deflate.deflate_raw(data);
+            // Incompressible data (already compressed, random) is stored as is.
+            if (packed.len() >= data.len()) {
+                Packed {
+                    index: index,
+                    crc: sum,
+                    method: format.STORED,
+                    size: data.len(),
+                    payload: data,
+                    error: ""
+                }
+            } else {
+                Packed {
+                    index: index,
+                    crc: sum,
+                    method: format.DEFLATED,
+                    size: data.len(),
+                    payload: packed,
+                    error: ""
+                }
+            }
+        },
+        Result.Err(e) => Packed { index: index, crc: 0, method: 0, size: 0, payload: b"", error: "${path}: ${e}" },
+    }
+}
+
+fn worker(jobs: Channel<Job>, done: Channel<Packed>) {
+    while (true) {
+        match (recv(jobs)) {
+            Option.Some(j) => send(done, pack(j.index, j.path, j.store_only)),
+            Option.None => break,
+        }
+    }
+}
+
+fn name_flags(name: string) -> int {
+    for c in name.chars() {
+        if (char_code(c) > 127) {
+            return format.FLAG_UTF8;
+        }
+    }
+    0
+}
+
+fn entry_for(s: Source, o: Options, offset: int) -> Entry {
+    let (t, d) = dostime.encode(o.clock, s.mtime_ms);
+    Entry {
+        name: s.name,
+        method: format.STORED,
+        flags: name_flags(s.name),
+        crc: 0,
+        compressed: 0,
+        size: s.size,
+        offset: offset,
+        dos_time: t,
+        dos_date: d,
+        unix_time: Option.Some(s.mtime_ms / 1000),
+        mode: if (s.is_dir) { format.dir_mode(s.perm) } else { format.file_mode(s.perm) },
+        is_dir: s.is_dir
+    }
+}
+
+fn deflatable(s: Source, o: Options) -> bool {
+    !s.is_dir && s.size <= o.deflate_limit
+}
+
+/// The writer's state: the output handle, where it is and the central directory so far.
+struct Out {
+    h: int,
+    offset: int,
+    central: bytesbuilder.BytesBuilder,
+    count: int,
+    summary: Summary,
+}
+
+fn put(out: Out, b: bytes) -> Result<int, string> {
+    fs.write_bytes(out.h, b)?;
+    out.offset = out.offset + b.len();
+    Result.Ok(b.len())
+}
+
+fn add(out: Out, e: Entry, payload: bytes) -> Result<int, string> {
+    put(out, format.local_header(e))?;
+    put(out, payload)?;
+    bytesbuilder.push(out.central, format.central_header(e));
+    out.count = out.count + 1;
+    out.summary.bytes_in = out.summary.bytes_in + e.size;
+    if (e.is_dir) {
+        out.summary.dirs = out.summary.dirs + 1;
+    } else {
+        out.summary.files = out.summary.files + 1;
+    }
+    Result.Ok(0)
+}
+
+/// A big file, stored in chunks; the CRC is only known at the end and goes back into the
+/// local header (at offset 14).
+fn add_streamed(out: Out, s: Source, e: Entry) -> Result<int, string> {
+    e.compressed = s.size;
+    let header_at = out.offset;
+    put(out, format.local_header(e))?;
+    let src = fs.open(s.path, "r")?;
+    let sum = crc.new();
+    var copied = 0;
+    var failed = "";
+    while (failed == "") {
+        match (fs.read_bytes(src, CHUNK)) {
+            Result.Ok(Option.Some(chunk)) => {
+                crc.update(sum, chunk);
+                copied = copied + chunk.len();
+                match (put(out, chunk)) {
+                    Result.Ok(_) => { },
+                    Result.Err(m) => failed = m,
+                }
+            },
+            Result.Ok(Option.None) => break,
+            Result.Err(m) => failed = "${s.path}: ${m}",
+        }
+    }
+    close(src);
+    if (failed != "") {
+        return Result.Err(failed);
+    }
+    if (copied != s.size) {
+        return Result.Err("${s.path}: changed while being read (${copied} bytes, not ${s.size})");
+    }
+    e.crc = sum.value;
+    let end = out.offset;
+    fs.seek(out.h, header_at + 14)?;
+    let patch = bytesbuilder.new();
+    bytesbuilder.push_byte(patch, e.crc & 0xFF);
+    bytesbuilder.push_byte(patch, (e.crc >> 8) & 0xFF);
+    bytesbuilder.push_byte(patch, (e.crc >> 16) & 0xFF);
+    bytesbuilder.push_byte(patch, (e.crc >> 24) & 0xFF);
+    fs.write_bytes(out.h, bytesbuilder.build(patch))?;
+    fs.seek(out.h, end)?;
+    bytesbuilder.push(out.central, format.central_header(e));
+    out.count = out.count + 1;
+    out.summary.files = out.summary.files + 1;
+    out.summary.bytes_in = out.summary.bytes_in + e.size;
+    Result.Ok(0)
+}
+
+fn add_packed(out: Out, s: Source, p: Packed, o: Options) -> Result<int, string> {
+    if (p.error != "") {
+        return Result.Err(p.error);
+    }
+    let e = entry_for(s, o, out.offset);
+    e.size = p.size;
+    e.crc = p.crc;
+    e.method = p.method;
+    e.compressed = p.payload.len();
+    add(out, e, p.payload)
+}
+
+/// Writes `list` to the archive at `path` (through a temporary file renamed at the end, so a
+/// failure never leaves half an archive). `progress` is called with each entry's name.
+pub fn create(
+    path: string,
+    list: [Source],
+    o: Options,
+    progress: fn(string)
+) -> Result<Summary, string> {
+    let tmp = "${path}.rayzip-tmp";
+    let h = fs.open(tmp, "w")?;
+    let out = Out {
+        h: h,
+        offset: 0,
+        central: bytesbuilder.new(),
+        count: 0,
+        summary: Summary { files: 0, dirs: 0, bytes_in: 0, bytes_out: 0 }
+    };
+    let written = if (o.jobs <= 1) {
+        write_sequential(out, list, o, progress)
+    } else {
+        write_parallel(out, list, o, progress)
+    };
+    let finished = match (written) {
+        Result.Ok(_) => {
+            let cd = bytesbuilder.build(out.central);
+            let cd_at = out.offset;
+            match (put(out, cd)) {
+                Result.Ok(_) => put(out, format.end_records(out.count, cd_at, cd.len())),
+                Result.Err(m) => Result.Err(m),
+            }
+        },
+        Result.Err(m) => Result.Err(m),
+    };
+    close(h);
+    match (finished) {
+        Result.Ok(_) => {
+            fs.rename(tmp, path)?;
+            out.summary.bytes_out = out.offset;
+            Result.Ok(out.summary)
+        },
+        Result.Err(m) => {
+            let _ = fs.remove_file(tmp);
+            Result.Err(m)
+        },
+    }
+}
+
+fn add_one(out: Out, s: Source, o: Options) -> Result<int, string> {
+    let e = entry_for(s, o, out.offset);
+    if (s.is_dir) {
+        e.size = 0;
+        return add(out, e, b"");
+    }
+    if (deflatable(s, o)) {
+        return add_packed(out, s, pack(0, s.path, o.store_only), o);
+    }
+    add_streamed(out, s, e)
+}
+
+fn write_sequential(
+    out: Out,
+    list: [Source],
+    o: Options,
+    progress: fn(string)
+) -> Result<int, string> {
+    for s in list {
+        progress(s.name);
+        add_one(out, s, o)?;
+    }
+    Result.Ok(0)
+}
+
+/// The workers compress up to `2 × jobs` files ahead of the writer, which takes them in order.
+fn write_parallel(
+    out: Out,
+    list: [Source],
+    o: Options,
+    progress: fn(string)
+) -> Result<int, string> {
+    let window = o.jobs * 2;
+    let jobs: Channel<Job> = Channel.bounded(window);
+    let done: Channel<Packed> = Channel.bounded(window);
+    let workers: [Task<unit>] = [];
+    for _ in 0..o.jobs {
+        workers.push(spawn(fn() {
+            worker(jobs, done);
+        }));
+    }
+    let r = write_in_order(out, list, o, progress, jobs, done, window);
+    close(jobs);
+    // Drain what is still in flight so no worker stays blocked on `done`.
+    for t in workers {
+        while (true) {
+            match (try_recv(done)) {
+                Received.Got(_) => { },
+                _ => break,
+            }
+        }
+        join(t);
+    }
+    r
+}
+
+fn write_in_order(
+    out: Out,
+    list: [Source],
+    o: Options,
+    progress: fn(string),
+    jobs: Channel<Job>,
+    done: Channel<Packed>,
+    window: int
+) -> Result<int, string> {
+    let ready: Map<int, Packed> = Map.new();
+    var submitted = 0;
+    var in_flight = 0;
+    for i in 0..list.len() {
+        while (submitted < list.len() && in_flight < window) {
+            let s = list[submitted];
+            if (deflatable(s, o)) {
+                send(jobs, Job { index: submitted, path: s.path, store_only: o.store_only });
+                in_flight = in_flight + 1;
+            }
+            submitted = submitted + 1;
+        }
+        let s = list[i];
+        progress(s.name);
+        if (deflatable(s, o)) {
+            while (!ready.contains_key(i)) {
+                match (recv(done)) {
+                    Option.Some(p) => {
+                        in_flight = in_flight - 1;
+                        ready.insert(p.index, p);
+                    },
+                    Option.None => return Result.Err("the compression workers stopped"),
+                }
+            }
+            let p = ready.get(i).unwrap();
+            ready.remove(i);
+            add_packed(out, s, p, o)?;
+        } else {
+            add_one(out, s, o)?;
+        }
+    }
+    Result.Ok(0)
+}

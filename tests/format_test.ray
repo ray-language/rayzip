@@ -1,0 +1,132 @@
+// The ZIP records: what the encoders write, the decoders read back, and the DOS clock.
+
+import std/collections/bytesbuilder;
+import dostime;
+import format;
+import le;
+from format import Entry;
+
+fn entry(name: string, size: int, compressed: int, offset: int) -> Entry {
+    Entry {
+        name: name,
+        method: format.DEFLATED,
+        flags: 0,
+        crc: 0x12345678,
+        compressed: compressed,
+        size: size,
+        offset: offset,
+        dos_time: 0x6000,
+        dos_date: 0x5A55,
+        unix_time: Option.Some(1760000000),
+        mode: format.file_mode(0o640),
+        is_dir: false
+    }
+}
+
+@test
+fn a_central_header_reads_back() {
+    let e = entry("dir/ñandú.txt", 1234, 567, 89);
+    let got = format.central_entries(format.central_header(e), 1).unwrap();
+    assert_eq(got.len(), 1);
+    let g = got[0];
+    assert_eq(g.name, "dir/ñandú.txt");
+    assert_eq(g.size, 1234);
+    assert_eq(g.compressed, 567);
+    assert_eq(g.offset, 89);
+    assert_eq(g.crc, 0x12345678);
+    assert_eq(g.method, format.DEFLATED);
+    assert_eq(format.permissions(g), 0o640);
+    assert_eq(g.unix_time, Option.Some(1760000000));
+    assert(!g.is_dir);
+    assert(!format.is_symlink(g));
+}
+
+@test
+fn sizes_and_offsets_past_4_gib_go_in_the_zip64_field() {
+    let e = entry("big.bin", 5 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024 + 7, 0x100000000);
+    let cd = format.central_header(e);
+    // The classic slots are saturated.
+    assert_eq(le.u32_at(cd, 20), format.MAX32);
+    assert_eq(le.u32_at(cd, 24), format.MAX32);
+    assert_eq(le.u32_at(cd, 42), format.MAX32);
+    let g = format.central_entries(cd, 1).unwrap()[0];
+    assert_eq(g.size, 5 * 1024 * 1024 * 1024);
+    assert_eq(g.compressed, 4 * 1024 * 1024 * 1024 + 7);
+    assert_eq(g.offset, 0x100000000);
+    // The local header carries both sizes in its ZIP64 field, and needs version 4.5.
+    let lh = format.local_header(e);
+    assert_eq(le.u16_at(lh, 4), 45);
+    assert_eq(le.u32_at(lh, 18), format.MAX32);
+    assert_eq(le.u16_at(lh, 30 + 7), 0x0001);
+}
+
+@test
+fn the_end_record_is_found_behind_a_comment() {
+    let b = bytesbuilder.new();
+    bytesbuilder.push(b, b"garbage before");
+    let end = format.end_records(3, 100, 200);
+    // Patch in a comment: the classic record's last field is the comment length.
+    bytesbuilder.push(b, end.sub_bytes(0, end.len() - 2));
+    le.put_u16(b, 5);
+    bytesbuilder.push(b, b"hello");
+    let tail = bytesbuilder.build(b);
+    let (at, d) = format.find_eocd(tail).unwrap();
+    assert_eq(at, 14);
+    assert_eq(d.count, 3);
+    assert_eq(d.offset, 100);
+    assert_eq(d.size, 200);
+    assert_eq(d.comment, "hello");
+    assert(!format.wants_zip64(d));
+}
+
+@test
+fn more_than_65534_entries_need_the_zip64_end_records() {
+    let end = format.end_records(70000, 1000, 5000);
+    assert_eq(end.len(), format.ZIP64_EOCD_LEN + format.ZIP64_LOCATOR_LEN + format.EOCD_LEN);
+    let (at, classic) = format.find_eocd(end).unwrap();
+    assert(format.wants_zip64(classic));
+    let locator = end.sub_bytes(at - format.ZIP64_LOCATOR_LEN, at);
+    assert_eq(format.zip64_locator(locator), Option.Some(6000));
+    let d = format.zip64_eocd(end, classic).unwrap();
+    assert_eq(d.count, 70000);
+    assert_eq(d.offset, 1000);
+    assert_eq(d.size, 5000);
+}
+
+@test
+fn not_a_zip() {
+    assert(format.find_eocd(b"just some text, no end record").is_err());
+    assert(format.central_entries(b"PK\x01\x02short", 1).is_err());
+}
+
+@test
+fn names_that_are_not_utf8_read_as_latin1() {
+    assert_eq(format.text_of(b"caf\xe9"), "café");
+    assert_eq(format.text_of("ñ".to_bytes()), "ñ");
+}
+
+@test
+fn dos_time_round_trips_at_two_second_resolution() {
+    let c = dostime.utc();
+    // 2026-10-21 10:30:44 UTC.
+    let ms = 1792578644000;
+    let (t, d) = dostime.encode(c, ms);
+    assert_eq(dostime.decode(c, t, d), ms);
+    let (t2, d2) = dostime.encode(c, ms + 1000);
+    assert_eq(dostime.decode(c, t2, d2), ms);
+    // Before 1980 clamps to 1980-01-01.
+    let (t0, d0) = dostime.encode(c, 0);
+    assert_eq((t0, d0), (0, (1 << 5) | 1));
+}
+
+@test
+fn dos_time_is_local_time() {
+    let madrid = dostime.zone("Europe/Madrid").unwrap();
+    // 2026-07-01 12:00:00 UTC is 14:00 in Madrid (CEST, +2).
+    let ms = 1782907200000;
+    let (t, d) = dostime.encode(madrid, ms);
+    assert_eq(t >> 11, 14);
+    assert_eq(dostime.decode(madrid, t, d), ms);
+    let (tu, _) = dostime.encode(dostime.utc(), ms);
+    assert_eq(tu >> 11, 12);
+}

@@ -1,0 +1,37 @@
+// More than 65535 entries: the count only fits in the ZIP64 end record.
+
+import std/fs;
+import std/zip;
+import archive;
+import create;
+import dostime;
+import sources;
+
+@test
+fn seventy_thousand_entries() {
+    let root = fs.make_temp_dir("rayzip-zip64").unwrap();
+    fs.write_file("${root}/one", "1").unwrap();
+    let list: [sources.Source] = [];
+    for i in 0..70000 {
+        list.push(
+            sources.Source {
+                path: "${root}/one",
+                name: "f/${i}",
+                is_dir: false,
+                size: 1,
+                mtime_ms: 1760000000000,
+                perm: 0o644
+            }
+        );
+    }
+    let o = create.Options { store_only: true, deflate_limit: 1024, jobs: 1, clock: dostime.utc() };
+    let s = create.create("${root}/many.zip", list, o, fn(name: string) { }).unwrap();
+    assert_eq(s.files, 70000);
+    let a = archive.open("${root}/many.zip").unwrap();
+    assert_eq(a.entries.len(), 70000);
+    assert_eq(a.entries[69999].name, "f/69999");
+    archive.close_archive(a);
+    // std/zip refuses ZIP64 (its doc says so): here it is a whole archive it cannot read.
+    assert(zip.open(fs.read_file_bytes("${root}/many.zip").unwrap()).is_err());
+    fs.remove_all(root).unwrap();
+}

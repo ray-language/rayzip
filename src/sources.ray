@@ -1,0 +1,97 @@
+//! What goes into an archive: the paths given on the command line, walked recursively, each
+//! with the name it gets inside the archive.
+
+import std/fs;
+
+pub struct Source {
+    /// Where it is on disk.
+    path: string,
+    /// Its name in the archive: `/` separators, a directory ends in `/`.
+    name: string,
+    is_dir: bool,
+    size: int,
+    mtime_ms: int,
+    /// Permission bits (st_mode & 0o777).
+    perm: int,
+}
+
+/// The archive name of a path as typed: no leading `/` or `./`, no `.` or `..` components,
+/// `\` read as `/` (what `zip` does).
+pub fn archive_name(path: string) -> string {
+    let parts: [string] = [];
+    for p in path.replace("\\", "/").split("/") {
+        if (p != "" && p != "." && p != "..") {
+            parts.push(p);
+        }
+    }
+    join(parts, "/")
+}
+
+/// Walks the inputs in order, directories depth-first with their entries sorted. Symlinks are
+/// followed (as `zip` does without `-y`; there is no way to read a link's target text);
+/// `skip` is the real path of the archive being written, so it never goes into itself.
+pub fn collect(inputs: [string], skip: string) -> Result<[Source], string> {
+    let out: [Source] = [];
+    let seen: Map<string, bool> = Map.new();
+    for input in inputs {
+        if (!fs.exists(input)) {
+            return Result.Err("${input}: no such file or directory");
+        }
+        walk(input, archive_name(input), skip, seen, out)?;
+    }
+    Result.Ok(out)
+}
+
+fn walk(
+    path: string,
+    name: string,
+    skip: string,
+    seen: Map<string, bool>,
+    out: [Source]
+) -> Result<int, string> {
+    let real = fs.real_path(path)?;
+    if (real == skip) {
+        return Result.Ok(0);
+    }
+    if (fs.is_dir(path)) {
+        // A followed symlink can lead back to an ancestor: each directory once.
+        if (seen.contains_key(real)) {
+            return Result.Ok(0);
+        }
+        seen.insert(real, true);
+        let st = fs.stat(real)?;
+        if (name != "") {
+            out.push(
+                Source {
+                    path: path,
+                    name: "${name}/",
+                    is_dir: true,
+                    size: 0,
+                    mtime_ms: st.mtime_ms,
+                    perm: st.mode & 0o777
+                }
+            );
+        }
+        for child in fs.list_dir(path)? {
+            let child_name = if (name == "") { child } else { "${name}/${child}" };
+            walk("${path}/${child}", child_name, skip, seen, out)?;
+        }
+        return Result.Ok(0);
+    }
+    if (!fs.is_file(path)) {
+        // A dangling symlink, a socket, a device: nothing to store.
+        return Result.Ok(0);
+    }
+    let st = fs.stat(real)?;
+    out.push(
+        Source {
+            path: path,
+            name: name,
+            is_dir: false,
+            size: st.size,
+            mtime_ms: st.mtime_ms,
+            perm: st.mode & 0o777
+        }
+    );
+    Result.Ok(0)
+}

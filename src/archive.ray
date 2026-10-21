@@ -1,0 +1,172 @@
+//! Reading an archive from disk without loading it: the end records and the central directory
+//! are read from the tail, and each entry's data is read (and inflated) chunk by chunk.
+//! `std/zip` does the same job in memory: the whole file in one `bytes`, no ZIP64.
+
+import std/collections/bytesbuilder;
+import std/fs;
+import std/inflate;
+import crc;
+import format;
+from format import Entry;
+
+pub struct Archive {
+    path: string,
+    handle: int,
+    entries: [Entry],
+    comment: string,
+}
+
+/// Entries whose compressed data is at most this big are read and inflated in one call (the
+/// runtime's inflate); bigger ones go through `std/inflate`'s streaming decoder, in raylang, ~15×
+/// slower but with bounded memory.
+pub const WHOLE_LIMIT: int = 64 * 1024 * 1024;
+
+const CHUNK: int = 1024 * 1024;
+
+pub fn open(path: string) -> Result<Archive, string> {
+    let size = fs.file_size(path)?;
+    let h = fs.open(path, "r")?;
+    match (read_directory(h, size)) {
+        Result.Ok((entries, comment)) => Result.Ok(Archive { path: path, handle: h, entries: entries, comment: comment }),
+        Result.Err(e) => {
+            close(h);
+            Result.Err(e)
+        },
+    }
+}
+
+pub fn close_archive(a: Archive) {
+    close(a.handle);
+}
+
+fn read_directory(h: int, size: int) -> Result<([Entry], string), string> {
+    let tail_len = if (size < 65536 + format.EOCD_LEN) { size } else { 65536 + format.EOCD_LEN };
+    let tail_at = size - tail_len;
+    let tail = read_at(h, tail_at, tail_len)?;
+    let (eocd_at, classic) = format.find_eocd(tail)?;
+    var d = classic;
+    let locator_at = tail_at + eocd_at - format.ZIP64_LOCATOR_LEN;
+    if (locator_at >= 0) {
+        let loc = read_at(h, locator_at, format.ZIP64_LOCATOR_LEN)?;
+        if let Option.Some(record_at) = format.zip64_locator(loc) {
+            d = format.zip64_eocd(read_at(h, record_at, format.ZIP64_EOCD_LEN)?, classic)?;
+        } else if (format.wants_zip64(classic)) {
+            return Result.Err("corrupt archive: ZIP64 fields without a ZIP64 record");
+        }
+    }
+    if (d.offset + d.size > size) {
+        return Result.Err("corrupt archive: the central directory lies past the end of the file");
+    }
+    let cd = read_at(h, d.offset, d.size)?;
+    let entries = format.central_entries(cd, d.count)?;
+    Result.Ok((entries, d.comment))
+}
+
+/// Exactly `n` bytes from `at`, or `Err` if the file ends first.
+pub fn read_at(h: int, at: int, n: int) -> Result<bytes, string> {
+    fs.seek(h, at)?;
+    let b = bytesbuilder.new();
+    while (bytesbuilder.len(b) < n) {
+        match (fs.read_bytes(h, n - bytesbuilder.len(b))?) {
+            Option.Some(chunk) => bytesbuilder.push(b, chunk),
+            Option.None => return Result.Err("unexpected end of file at ${at + bytesbuilder.len(b)}"),
+        }
+    }
+    Result.Ok(bytesbuilder.build(b))
+}
+
+fn check_supported(e: Entry) -> Result<int, string> {
+    if ((e.flags & format.FLAG_ENCRYPTED) != 0) {
+        return Result.Err("${e.name}: encrypted entries are not supported");
+    }
+    if (e.method != format.STORED && e.method != format.DEFLATED) {
+        return Result.Err("${e.name}: compression method ${e.method} is not supported");
+    }
+    Result.Ok(0)
+}
+
+/// Reads one entry's data, verifying size and CRC-32, and hands it to `sink` in order (a chunk
+/// at a time for big entries). `sink` returns `Err` to abort. Returns the size.
+pub fn read_entry(
+    a: Archive,
+    e: Entry,
+    sink: fn(bytes) -> Result<int, string>
+) -> Result<int, string> {
+    read_entry_with(a, e, WHOLE_LIMIT, sink)
+}
+
+/// `read_entry` with the size up to which an entry is inflated in one call.
+pub fn read_entry_with(
+    a: Archive,
+    e: Entry,
+    whole_limit: int,
+    sink: fn(bytes) -> Result<int, string>
+) -> Result<int, string> {
+    check_supported(e)?;
+    let local = read_at(a.handle, e.offset, format.LOCAL_LEN)?;
+    let data_at = format.data_offset(local, e.offset)?;
+    if (e.compressed <= whole_limit) {
+        let raw = read_at(a.handle, data_at, e.compressed)?;
+        let data = if (e.method == format.STORED) {
+            raw
+        } else {
+            // The declared size caps the output: a lying entry cannot expand without bound.
+            inflate.inflate_raw_limit(raw, e.size)
+                .map_err(fn(m: string) -> string { "${e.name}: ${m}" })?
+        };
+        if (data.len() != e.size) {
+            return Result.Err("${e.name}: size ${data.len()} instead of ${e.size}");
+        }
+        if (inflate.crc32(data) != e.crc) {
+            return Result.Err("${e.name}: CRC-32 mismatch");
+        }
+        sink(data)?;
+        return Result.Ok(data.len());
+    }
+    stream_entry(a, e, data_at, sink)
+}
+
+fn stream_entry(
+    a: Archive,
+    e: Entry,
+    data_at: int,
+    sink: fn(bytes) -> Result<int, string>
+) -> Result<int, string> {
+    let sum = crc.new();
+    let z = inflate.inflate_stream();
+    inflate.stream_set_limit(z, e.size);
+    var read = 0;
+    var produced = 0;
+    fs.seek(a.handle, data_at)?;
+    while (read < e.compressed) {
+        let want = if (e.compressed - read < CHUNK) { e.compressed - read } else { CHUNK };
+        let chunk = match (fs.read_bytes(a.handle, want)?) {
+            Option.Some(c) => c,
+            Option.None => return Result.Err("${e.name}: truncated data"),
+        };
+        read = read + chunk.len();
+        let out = if (e.method == format.STORED) {
+            chunk
+        } else {
+            inflate.stream_push(z, chunk).map_err(fn(m: string) -> string { "${e.name}: ${m}" })?
+        };
+        if (out.len() > 0) {
+            produced = produced + out.len();
+            if (produced > e.size) {
+                return Result.Err("${e.name}: more data than the declared ${e.size} bytes");
+            }
+            crc.update(sum, out);
+            sink(out)?;
+        }
+    }
+    if (e.method == format.DEFLATED && !inflate.stream_finished(z)) {
+        return Result.Err("${e.name}: truncated deflate stream");
+    }
+    if (produced != e.size) {
+        return Result.Err("${e.name}: size ${produced} instead of ${e.size}");
+    }
+    if (sum.value != e.crc) {
+        return Result.Err("${e.name}: CRC-32 mismatch");
+    }
+    Result.Ok(produced)
+}

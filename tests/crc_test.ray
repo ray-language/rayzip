@@ -1,0 +1,49 @@
+// The streaming CRC-32 (one-shot sums joined with crc32_combine) against the one-shot sum.
+
+import std/inflate;
+import std/random;
+import crc;
+
+fn sample(n: int) -> bytes {
+    let xs: [int] = [];
+    for i in 0..n {
+        xs.push((i * 7919 + i / 13) & 0xFF);
+    }
+    bytes_of(xs)
+}
+
+@test
+fn combine_matches_the_sum_of_the_concatenation() {
+    let data = sample(100000);
+    let whole = inflate.crc32(data);
+    for split in [0, 1, 2, 31, 32, 33, 4096, 65535, 99999, 100000] {
+        let a = data.sub_bytes(0, split);
+        let b = data.sub_bytes(split, data.len());
+        assert_eq(crc.combine(inflate.crc32(a), inflate.crc32(b), b.len()), whole);
+    }
+}
+
+@test
+fn a_running_sum_over_uneven_chunks() {
+    let data = sample(300000);
+    let sum = crc.new();
+    var i = 0;
+    while (i < data.len()) {
+        let n = 1 + random.below(20000);
+        let j = if (i + n < data.len()) { i + n } else { data.len() };
+        crc.update(sum, data.sub_bytes(i, j));
+        i = j;
+    }
+    assert_eq(sum.value, inflate.crc32(data));
+}
+
+@test
+fn known_values() {
+    // The CRC-32 check value of "123456789".
+    let sum = crc.new();
+    crc.update(sum, b"1234");
+    crc.update(sum, b"");
+    crc.update(sum, b"56789");
+    assert_eq(sum.value, 0xCBF43926);
+    assert_eq(crc.new().value, 0);
+}

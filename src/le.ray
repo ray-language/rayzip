@@ -1,0 +1,35 @@
+//! Little-endian integers in and out of byte buffers: ZIP and gzip are little-endian throughout.
+
+import std/collections/bytesbuilder;
+from std/collections/bytesbuilder import BytesBuilder;
+
+pub fn put_u8(b: BytesBuilder, v: int) {
+    bytesbuilder.push_byte(b, v & 0xFF);
+}
+
+pub fn put_u16(b: BytesBuilder, v: int) {
+    bytesbuilder.push_byte(b, v & 0xFF);
+    bytesbuilder.push_byte(b, (v >> 8) & 0xFF);
+}
+
+pub fn put_u32(b: BytesBuilder, v: int) {
+    put_u16(b, v & 0xFFFF);
+    put_u16(b, (v >> 16) & 0xFFFF);
+}
+
+pub fn put_u64(b: BytesBuilder, v: int) {
+    put_u32(b, v & 0xFFFFFFFF);
+    put_u32(b, (v >> 32) & 0xFFFFFFFF);
+}
+
+pub fn u16_at(b: bytes, i: int) -> int {
+    b[i] | (b[i + 1] << 8)
+}
+
+pub fn u32_at(b: bytes, i: int) -> int {
+    u16_at(b, i) | (u16_at(b, i + 2) << 16)
+}
+
+pub fn u64_at(b: bytes, i: int) -> int {
+    u32_at(b, i) | (u32_at(b, i + 4) << 32)
+}

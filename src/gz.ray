@@ -1,0 +1,376 @@
+//! gzip (RFC 1952). rayzip writes a file as a series of members of 4 MiB each (a valid gzip:
+//! `gunzip` concatenates members), deflated by worker fibers in parallel; each member records its
+//! own length in an extra subfield `RZ`, as BGZF does, because `std/inflate` cannot say where a
+//! deflate stream ended in its input. With that length, reading is one fast inflate per member.
+//! Files from other tools are a single member: inflated whole, or streamed if big.
+
+import std/collections/bytesbuilder;
+import std/deflate;
+import std/fs;
+import std/inflate;
+import archive;
+import crc;
+import le;
+
+pub const MEMBER: int = 4 * 1024 * 1024;
+
+const ID1: int = 0x1F;
+
+const ID2: int = 0x8B;
+
+const FHCRC: int = 2;
+
+const FEXTRA: int = 4;
+
+const FNAME: int = 8;
+
+const FCOMMENT: int = 16;
+
+const OS_UNIX: int = 3;
+
+const HEADER_FIXED: int = 10;
+
+struct Job {
+    index: int,
+    data: bytes,
+    name: string,
+    mtime: int,
+}
+
+struct Member {
+    index: int,
+    data: bytes,
+}
+
+/// One complete member: header (with the `RZ` length subfield, and the name and time in the
+/// first), deflated data, CRC-32 and size.
+pub fn member(data: bytes, name: string, mtime_secs: int) -> bytes {
+    let body = deflate.deflate_raw(data);
+    let name_bytes = name.to_bytes();
+    let name_len = if (name == "") { 0 } else { name_bytes.len() + 1 };
+    let total = HEADER_FIXED + 2 + 8 + name_len + body.len() + 8;
+    let b = bytesbuilder.new();
+    le.put_u8(b, ID1);
+    le.put_u8(b, ID2);
+    le.put_u8(b, 8);
+    le.put_u8(b, FEXTRA | if (name == "") { 0 } else { FNAME });
+    le.put_u32(b, mtime_secs);
+    le.put_u8(b, 0);
+    le.put_u8(b, OS_UNIX);
+    le.put_u16(b, 8);
+    le.put_u8(b, 0x52);
+    le.put_u8(b, 0x5A);
+    le.put_u16(b, 4);
+    le.put_u32(b, total);
+    if (name != "") {
+        bytesbuilder.push(b, name_bytes);
+        le.put_u8(b, 0);
+    }
+    bytesbuilder.push(b, body);
+    le.put_u32(b, inflate.crc32(data));
+    le.put_u32(b, data.len() & 0xFFFFFFFF);
+    bytesbuilder.build(b)
+}
+
+fn worker(jobs: Channel<Job>, done: Channel<Member>) {
+    while (true) {
+        match (recv(jobs)) {
+            Option.Some(j) => send(done, Member { index: j.index, data: member(j.data, j.name, j.mtime) }),
+            Option.None => break,
+        }
+    }
+}
+
+/// Compresses `src` into `dst` with `jobs` workers. Returns (bytes in, bytes out).
+pub fn compress(src: string, dst: string, jobs: int) -> Result<(int, int), string> {
+    let st = fs.stat(src)?;
+    let name = match (src.last_index_of("/")) {
+        Option.Some(i) => src.substring(i + 1, src.len()),
+        Option.None => src,
+    };
+    let input = fs.open(src, "r")?;
+    let tmp = "${dst}.rayzip-tmp";
+    let out = match (fs.open(tmp, "w")) {
+        Result.Ok(h) => h,
+        Result.Err(e) => {
+            close(input);
+            return Result.Err(e);
+        },
+    };
+    let n = if (jobs < 1) { 1 } else { jobs };
+    let window = n * 2;
+    let job_ch: Channel<Job> = Channel.bounded(window);
+    let done: Channel<Member> = Channel.bounded(window);
+    let workers: [Task<unit>] = [];
+    for _ in 0..n {
+        workers.push(spawn(fn() {
+            worker(job_ch, done);
+        }));
+    }
+    let r = pump(input, out, job_ch, done, window, name, st.mtime_ms / 1000);
+    close(job_ch);
+    for t in workers {
+        while (true) {
+            match (try_recv(done)) {
+                Received.Got(_) => { },
+                _ => break,
+            }
+        }
+        join(t);
+    }
+    close(input);
+    close(out);
+    match (r) {
+        Result.Ok(sizes) => {
+            fs.rename(tmp, dst)?;
+            Result.Ok(sizes)
+        },
+        Result.Err(e) => {
+            let _ = fs.remove_file(tmp);
+            Result.Err(e)
+        },
+    }
+}
+
+/// Reads members' worth of input, keeps up to `window` in the workers, writes them in order.
+fn pump(
+    input: int,
+    out: int,
+    jobs: Channel<Job>,
+    done: Channel<Member>,
+    window: int,
+    name: string,
+    mtime: int
+) -> Result<(int, int), string> {
+    let ready: Map<int, bytes> = Map.new();
+    var read = 0;
+    var written = 0;
+    var submitted = 0;
+    var next = 0;
+    var eof = false;
+    while (true) {
+        while (!eof && submitted - next < window) {
+            match (fs.read_bytes(input, MEMBER)?) {
+                Option.Some(chunk) => {
+                    read = read + chunk.len();
+                    let first = submitted == 0;
+                    send(
+                        jobs,
+                        Job {
+                            index: submitted,
+                            data: chunk,
+                            name: if (first) { name } else { "" },
+                            mtime: if (first) { mtime } else { 0 }
+                        }
+                    );
+                    submitted = submitted + 1;
+                },
+                Option.None => eof = true,
+            }
+        }
+        if (next == submitted) {
+            break;
+        }
+        while (!ready.contains_key(next)) {
+            match (recv(done)) {
+                Option.Some(m) => ready.insert(m.index, m.data),
+                Option.None => return Result.Err("the compression workers stopped"),
+            }
+        }
+        let m = ready.get(next).unwrap();
+        ready.remove(next);
+        fs.write_bytes(out, m)?;
+        written = written + m.len();
+        next = next + 1;
+    }
+    // An empty file is still one (empty) member.
+    if (submitted == 0) {
+        let m = member(b"", name, mtime);
+        fs.write_bytes(out, m)?;
+        written = written + m.len();
+    }
+    Result.Ok((read, written))
+}
+
+/// A member's header: its length, the `RZ` member length if present, and the name.
+pub struct Header {
+    len: int,
+    member_len: Option<int>,
+    name: string,
+}
+
+/// Parses a member header at the start of `b` (which holds at least the whole header).
+pub fn header(b: bytes) -> Result<Header, string> {
+    if (b.len() < HEADER_FIXED || b[0] != ID1 || b[1] != ID2) {
+        return Result.Err("not a gzip file");
+    }
+    if (b[2] != 8) {
+        return Result.Err("unknown gzip compression method ${b[2]}");
+    }
+    let flags = b[3];
+    var p = HEADER_FIXED;
+    var member_len: Option<int> = Option.None;
+    if ((flags & FEXTRA) != 0) {
+        if (p + 2 > b.len()) {
+            return Result.Err("truncated gzip header");
+        }
+        let xlen = le.u16_at(b, p);
+        let end = p + 2 + xlen;
+        if (end > b.len()) {
+            return Result.Err("truncated gzip header");
+        }
+        var q = p + 2;
+        while (q + 4 <= end) {
+            let len = le.u16_at(b, q + 2);
+            if (b[q] == 0x52 && b[q + 1] == 0x5A && len == 4 && q + 8 <= end) {
+                member_len = Option.Some(le.u32_at(b, q + 4));
+            }
+            q = q + 4 + len;
+        }
+        p = end;
+    }
+    var name = "";
+    if ((flags & FNAME) != 0) {
+        let start = p;
+        while (p < b.len() && b[p] != 0) {
+            p = p + 1;
+        }
+        if (p >= b.len()) {
+            return Result.Err("truncated gzip header");
+        }
+        name = from_utf8(b.sub_bytes(start, p)).unwrap_or("");
+        p = p + 1;
+    }
+    if ((flags & FCOMMENT) != 0) {
+        while (p < b.len() && b[p] != 0) {
+            p = p + 1;
+        }
+        if (p >= b.len()) {
+            return Result.Err("truncated gzip header");
+        }
+        p = p + 1;
+    }
+    if ((flags & FHCRC) != 0) {
+        p = p + 2;
+    }
+    Result.Ok(Header { len: p, member_len: member_len, name: name })
+}
+
+/// Decompresses `src` into `dst`. Returns (bytes in, bytes out).
+pub fn decompress(src: string, dst: string) -> Result<(int, int), string> {
+    let size = fs.file_size(src)?;
+    let input = fs.open(src, "r")?;
+    let tmp = "${dst}.rayzip-tmp";
+    let out = match (fs.open(tmp, "w")) {
+        Result.Ok(h) => h,
+        Result.Err(e) => {
+            close(input);
+            return Result.Err(e);
+        },
+    };
+    let r = members(input, size, out);
+    close(input);
+    close(out);
+    match (r) {
+        Result.Ok(n) => {
+            fs.rename(tmp, dst)?;
+            Result.Ok((size, n))
+        },
+        Result.Err(e) => {
+            let _ = fs.remove_file(tmp);
+            Result.Err(e)
+        },
+    }
+}
+
+fn check_trailer(trailer: bytes, data_crc: int, data_len: int) -> Result<int, string> {
+    if (le.u32_at(trailer, 0) != data_crc) {
+        return Result.Err("CRC-32 mismatch");
+    }
+    if (le.u32_at(trailer, 4) != (data_len & 0xFFFFFFFF)) {
+        return Result.Err("size mismatch");
+    }
+    Result.Ok(0)
+}
+
+fn members(input: int, size: int, out: int) -> Result<int, string> {
+    var p = 0;
+    var total = 0;
+    while (p < size) {
+        // A header with a name fits in 64 KiB + the fixed part for any sane file.
+        let peek_len = if (size - p < 65536) { size - p } else { 65536 };
+        let h = header(archive.read_at(input, p, peek_len)?)?;
+        match (h.member_len) {
+            Option.Some(len) => {
+                if (len < h.len + 8 || p + len > size) {
+                    return Result.Err("corrupt member length at ${p}");
+                }
+                let m = archive.read_at(input, p, len)?;
+                let trailer = m.sub_bytes(len - 8, len);
+                let data = inflate.inflate_raw_limit(
+                    m.sub_bytes(h.len, len - 8),
+                    le.u32_at(trailer, 4)
+                )?;
+                check_trailer(trailer, inflate.crc32(data), data.len())?;
+                fs.write_bytes(out, data)?;
+                total = total + data.len();
+                p = p + len;
+            },
+            Option.None => {
+                // A member from another tool: taken to run to the end of the file.
+                total = total + single(input, p + h.len, size, out)?;
+                p = size;
+            },
+        }
+    }
+    Result.Ok(total)
+}
+
+fn single(input: int, body_at: int, size: int, out: int) -> Result<int, string> {
+    if (size - body_at < 8) {
+        return Result.Err("truncated gzip file");
+    }
+    let trailer = archive.read_at(input, size - 8, 8)?;
+    let body_len = size - 8 - body_at;
+    let isize = le.u32_at(trailer, 4);
+    if (body_len <= archive.WHOLE_LIMIT) {
+        // ISIZE (the size mod 2^32) caps the output; past 4 GiB it wraps and the stream path,
+        // capped only by memory per chunk, takes over.
+        match (inflate.inflate_raw_limit(archive.read_at(input, body_at, body_len)?, isize)) {
+            Result.Ok(data) => {
+                check_trailer(
+                    trailer,
+                    inflate.crc32(data),
+                    data.len()
+                ).map_err(fn(m: string) -> string { "${m} (a multi-member gzip from another tool?)" })?;
+                fs.write_bytes(out, data)?;
+                return Result.Ok(data.len());
+            },
+            Result.Err(_) => { },
+        }
+    }
+    let z = inflate.inflate_stream();
+    let sum = crc.new();
+    var read = 0;
+    var produced = 0;
+    fs.seek(input, body_at)?;
+    while (read < body_len) {
+        let want = if (body_len - read < 1048576) { body_len - read } else { 1048576 };
+        let chunk = match (fs.read_bytes(input, want)?) {
+            Option.Some(c) => c,
+            Option.None => return Result.Err("truncated gzip file"),
+        };
+        read = read + chunk.len();
+        let data = inflate.stream_push(z, chunk)?;
+        if (data.len() > 0) {
+            crc.update(sum, data);
+            fs.write_bytes(out, data)?;
+            produced = produced + data.len();
+        }
+    }
+    if (!inflate.stream_finished(z)) {
+        return Result.Err("truncated deflate stream");
+    }
+    check_trailer(trailer, sum.value, produced)?;
+    Result.Ok(produced)
+}

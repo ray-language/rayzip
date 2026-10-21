@@ -1,0 +1,108 @@
+// gzip: members with their length, parallel compression, and files from other tools.
+
+import std/collections/bytesbuilder;
+import std/deflate;
+import std/fs;
+import std/inflate;
+import gz;
+import le;
+
+fn content(n: int) -> bytes {
+    let b = bytesbuilder.new();
+    var i = 0;
+    while (bytesbuilder.len(b) < n) {
+        bytesbuilder.push(b, "record ${i} ${i * i % 9973}\n".to_bytes());
+        i = i + 1;
+    }
+    bytesbuilder.build(b).sub_bytes(0, n)
+}
+
+fn round_trip(n: int, jobs: int) {
+    let root = fs.make_temp_dir("rayzip-gz").unwrap();
+    let data = content(n);
+    fs.write_file_bytes("${root}/f", data).unwrap();
+    let (n_in, n_out) = gz.compress("${root}/f", "${root}/f.gz", jobs).unwrap();
+    assert_eq(n_in, n);
+    assert_eq(n_out, fs.file_size("${root}/f.gz").unwrap());
+    let (_, back) = gz.decompress("${root}/f.gz", "${root}/g").unwrap();
+    assert_eq(back, n);
+    assert_eq(fs.read_file_bytes("${root}/g").unwrap(), data);
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn small_empty_and_multi_member_files_round_trip() {
+    round_trip(0, 1);
+    round_trip(1000, 1);
+    // Three members (4 MiB each), by one worker and by three.
+    round_trip(gz.MEMBER * 2 + 12345, 1);
+    round_trip(gz.MEMBER * 2 + 12345, 3);
+}
+
+@test
+fn the_first_member_carries_the_name_and_every_member_its_length() {
+    let root = fs.make_temp_dir("rayzip-gz").unwrap();
+    fs.write_file_bytes("${root}/notes.txt", content(gz.MEMBER + 10)).unwrap();
+    gz.compress("${root}/notes.txt", "${root}/n.gz", 2).unwrap();
+    let all = fs.read_file_bytes("${root}/n.gz").unwrap();
+    let h = gz.header(all).unwrap();
+    assert_eq(h.name, "notes.txt");
+    let len = h.member_len.unwrap();
+    let second = gz.header(all.sub_bytes(len, all.len())).unwrap();
+    assert_eq(second.name, "");
+    assert_eq(len + second.member_len.unwrap(), all.len());
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn std_gunzip_reads_a_single_member() {
+    let data = content(5000);
+    let m = gz.member(data, "x", 0);
+    assert_eq(inflate.gunzip(m).unwrap(), data);
+}
+
+@test
+fn files_from_other_writers_decompress() {
+    let root = fs.make_temp_dir("rayzip-gz").unwrap();
+    let data = content(200000);
+    // std/deflate's gzip: one member, no length field.
+    fs.write_file_bytes("${root}/s.gz", deflate.gzip_compress(data)).unwrap();
+    gz.decompress("${root}/s.gz", "${root}/s").unwrap();
+    assert_eq(fs.read_file_bytes("${root}/s").unwrap(), data);
+    // A header with every optional field: extra (not ours), name, comment and header CRC.
+    let b = bytesbuilder.new();
+    bytesbuilder.push(b, bytes_of([0x1F, 0x8B, 8, 4 | 8 | 16 | 2, 0, 0, 0, 0, 0, 3]));
+    le.put_u16(b, 6);
+    bytesbuilder.push(b, bytes_of([0x41, 0x42, 2, 0, 9, 9]));
+    bytesbuilder.push(b, b"name.txt\x00a comment\x00");
+    le.put_u16(b, 0);
+    bytesbuilder.push(b, deflate.deflate_raw(data));
+    le.put_u32(b, inflate.crc32(data));
+    le.put_u32(b, data.len());
+    fs.write_file_bytes("${root}/o.gz", bytesbuilder.build(b)).unwrap();
+    let h = gz.header(fs.read_file_bytes("${root}/o.gz").unwrap()).unwrap();
+    assert_eq(h.name, "name.txt");
+    assert_eq(h.member_len, Option.None);
+    gz.decompress("${root}/o.gz", "${root}/o").unwrap();
+    assert_eq(fs.read_file_bytes("${root}/o").unwrap(), data);
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn corruption_is_reported_and_leaves_no_output() {
+    let root = fs.make_temp_dir("rayzip-gz").unwrap();
+    let data = content(100000);
+    let m = gz.member(data, "", 0);
+    // A wrong CRC in the trailer.
+    let bad = bytes_concat(
+        [m.sub_bytes(0, m.len() - 8), bytes_of([0, 0, 0, 0]), m.sub_bytes(m.len() - 4, m.len())]
+    );
+    fs.write_file_bytes("${root}/bad.gz", bad).unwrap();
+    let r = gz.decompress("${root}/bad.gz", "${root}/bad");
+    assert(r.is_err());
+    assert(!fs.exists("${root}/bad"));
+    assert(!fs.exists("${root}/bad.rayzip-tmp"));
+    fs.write_file("${root}/plain.gz", "plain text").unwrap();
+    assert(gz.decompress("${root}/plain.gz", "${root}/plain").is_err());
+    fs.remove_all(root).unwrap();
+}

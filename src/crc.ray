@@ -1,0 +1,87 @@
+//! CRC-32 over a stream of chunks. `std/inflate` only has the one-shot `crc32(data)`, so each
+//! chunk is summed by it (the runtime's speed) and the partial sums are joined with zlib's
+//! `crc32_combine`: the CRC of A+B from crc(A), crc(B) and len(B), by squaring a GF(2) matrix.
+
+import std/inflate;
+
+/// A running CRC-32: `update` it with every chunk in order, read `value` at the end.
+pub struct Crc {
+    value: int,
+}
+
+pub fn new() -> Crc {
+    Crc { value: 0 }
+}
+
+pub fn update(c: Crc, chunk: bytes) {
+    c.value = combine(c.value, inflate.crc32(chunk), chunk.len());
+}
+
+fn times(mat: [int], vec: int) -> int {
+    var sum = 0;
+    var v = vec;
+    var i = 0;
+    while (v != 0) {
+        if ((v & 1) == 1) {
+            sum = sum ^ mat[i];
+        }
+        v = v >> 1;
+        i = i + 1;
+    }
+    sum
+}
+
+fn zeros(n: int) -> [int] {
+    let xs: [int] = [];
+    for _ in 0..n {
+        xs.push(0);
+    }
+    xs
+}
+
+fn square(dst: [int], mat: [int]) {
+    for n in 0..32 {
+        dst[n] = times(mat, mat[n]);
+    }
+}
+
+/// The CRC-32 of the concatenation A+B, given `crc1` = crc(A), `crc2` = crc(B) and `len2` =
+/// len(B).
+pub fn combine(crc1: int, crc2: int, len2: int) -> int {
+    if (len2 <= 0) {
+        return crc1;
+    }
+    let even = zeros(32);
+    let odd = zeros(32);
+    // The operator for one zero bit, then two (even) and four (odd) bits.
+    odd[0] = 0xEDB88320;
+    var row = 1;
+    for n in 1..32 {
+        odd[n] = row;
+        row = row << 1;
+    }
+    square(even, odd);
+    square(odd, even);
+    var c = crc1;
+    var len = len2;
+    // Apply len2 zero bytes to crc1, one bit of len2 at a time.
+    while (true) {
+        square(even, odd);
+        if ((len & 1) == 1) {
+            c = times(even, c);
+        }
+        len = len >> 1;
+        if (len == 0) {
+            break;
+        }
+        square(odd, even);
+        if ((len & 1) == 1) {
+            c = times(odd, c);
+        }
+        len = len >> 1;
+        if (len == 0) {
+            break;
+        }
+    }
+    c ^ crc2
+}

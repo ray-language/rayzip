@@ -1,0 +1,291 @@
+//! rayzip: ZIP archives and gzip files, compatible with zip/unzip/gzip.
+//!
+//!   rayzip c ARCHIVE PATH...    create (directories recursively)
+//!   rayzip x ARCHIVE [-d DIR]   extract
+//!   rayzip l ARCHIVE            list
+//!   rayzip t ARCHIVE            test (read everything, check sizes and CRCs)
+//!   rayzip gzip FILE            FILE → FILE.gz
+//!   rayzip gunzip FILE.gz       FILE.gz → FILE
+
+import std/fs;
+import std/text;
+import std/units;
+import archive;
+import create;
+import dostime;
+import extract;
+import format;
+import gz;
+import sources;
+
+const VERSION: string = "0.1.0";
+
+const USAGE: string = `usage:
+  rayzip c ARCHIVE PATH...   create an archive (directories recursively)
+  rayzip x ARCHIVE           extract it
+  rayzip l ARCHIVE           list its entries
+  rayzip t ARCHIVE           test it: read every entry and check its size and CRC-32
+  rayzip gzip FILE           compress FILE into FILE.gz
+  rayzip gunzip FILE.gz      decompress FILE.gz into FILE
+
+options:
+  -d DIR           extract into DIR (default: the current directory)
+  -o               overwrite existing files when extracting
+  -0               store only, no compression
+  -j N             compression workers (default: one per core)
+  --max-deflate S  files bigger than S are stored, not deflated (default 512M; K, M, G)
+  -c OUT           gzip/gunzip: write to OUT
+  -q               quiet
+  --version`;
+
+struct Cli {
+    command: string,
+    paths: [string],
+    dest: string,
+    overwrite: bool,
+    store_only: bool,
+    jobs: int,
+    max_deflate: int,
+    output: string,
+    quiet: bool,
+}
+
+/// A size like `512M`, `64K`, `2G` or a plain number of bytes.
+pub fn parse_size(s: string) -> Option<int> {
+    let u = s.to_upper();
+    if (u.ends_with("K")) {
+        return parse_int(u.substring(0, u.len() - 1)).map(fn(n: int) -> int { units.kb(n) });
+    }
+    if (u.ends_with("M")) {
+        return parse_int(u.substring(0, u.len() - 1)).map(fn(n: int) -> int { units.mb(n) });
+    }
+    if (u.ends_with("G")) {
+        return parse_int(u.substring(0, u.len() - 1)).map(fn(n: int) -> int { units.gb(n) });
+    }
+    parse_int(u)
+}
+
+fn parse_cli(argv: [string]) -> Result<Cli, string> {
+    if (argv.len() == 0) {
+        return Result.Err(USAGE);
+    }
+    let cli = Cli {
+        command: argv[0],
+        paths: [],
+        dest: ".",
+        overwrite: false,
+        store_only: false,
+        jobs: worker_count(),
+        max_deflate: units.mb(512),
+        output: "",
+        quiet: false
+    };
+    var i = 1;
+    while (i < argv.len()) {
+        let a = argv[i];
+        let has_value = i + 1 < argv.len();
+        if (a == "-d" && has_value) {
+            cli.dest = argv[i + 1];
+            i = i + 1;
+        } else if (a == "-c" && has_value) {
+            cli.output = argv[i + 1];
+            i = i + 1;
+        } else if (a == "-j" && has_value) {
+            cli.jobs = parse_int(argv[i + 1]).ok_or("-j: not a number: ${argv[i + 1]}")?;
+            i = i + 1;
+        } else if (a == "--max-deflate" && has_value) {
+            cli.max_deflate = parse_size(argv[i + 1]).ok_or(
+                "--max-deflate: not a size: ${argv[i + 1]}"
+            )?;
+            i = i + 1;
+        } else if (a == "-o") {
+            cli.overwrite = true;
+        } else if (a == "-0") {
+            cli.store_only = true;
+        } else if (a == "-q") {
+            cli.quiet = true;
+        } else if (a.starts_with("-") && a != "-") {
+            return Result.Err("unknown option ${a}\n\n${USAGE}");
+        } else {
+            cli.paths.push(a);
+        }
+        i = i + 1;
+    }
+    Result.Ok(cli)
+}
+
+fn pct(part: int, whole: int) -> string {
+    if (whole == 0) {
+        return "0%";
+    }
+    "${100 - (part * 100 / whole)}%"
+}
+
+fn two(n: int) -> string {
+    text.pad_left(to_string(n), 2, "0")
+}
+
+fn list(a: archive.Archive, clock: dostime.Clock) {
+    print(" Length   Method    Size  Cmpr        Date   Time    CRC-32  Name");
+    print("--------  ------  ------- ----  ---------- -----  --------  ----");
+    var size = 0;
+    var packed = 0;
+    for e in a.entries {
+        let ms = match (e.unix_time) {
+            Option.Some(s) => s * 1000,
+            Option.None => dostime.decode(clock, e.dos_time, e.dos_date),
+        };
+        let t = dostime.local(clock, ms);
+        let method = if (e.method == format.DEFLATED) {
+            "Defl"
+        } else if (e.method == format.STORED) {
+            "Stored"
+        } else {
+            "M${e.method}"
+        };
+        let crc = text.pad_left(hex32(e.crc), 8, "0");
+        print(
+            "${text.pad_left(to_string(e.size), 8, " ")}  ${text.pad_right(method, 6, " ")}  ${text.pad_left(to_string(e.compressed), 7, " ")} ${text.pad_left(pct(e.compressed, e.size), 4, " ")}  ${t.year}-${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}  ${crc}  ${e.name}"
+        );
+        size = size + e.size;
+        packed = packed + e.compressed;
+    }
+    print("--------          ------- ----                             -------");
+    print(
+        "${text.pad_left(to_string(size), 8, " ")}          ${text.pad_left(to_string(packed), 7, " ")} ${text.pad_left(pct(packed, size), 4, " ")}                             ${a.entries.len()} entries"
+    );
+}
+
+fn hex32(v: int) -> string {
+    let digits = "0123456789abcdef";
+    var s = "";
+    var x = v;
+    for _ in 0..8 {
+        s = to_string(digits[x & 15]) + s;
+        x = x >> 4;
+    }
+    s
+}
+
+fn run(cli: Cli) -> Result<int, string> {
+    let clock = dostime.system();
+    let progress = fn(name: string) {
+        if (!cli.quiet) {
+            eprint("  ${name}");
+        }
+    };
+    match (cli.command) {
+        "c" => {
+            if (cli.paths.len() < 2) {
+                return Result.Err("c needs an archive and at least one path");
+            }
+            let out = cli.paths[0];
+            let inputs = cli.paths.slice(1, cli.paths.len());
+            // The archive is written as `out.rayzip-tmp` until it is complete.
+            let skip = if (fs.exists(out)) { fs.real_path(out)? } else { "" };
+            let list = sources.collect(inputs, skip)?;
+            let o = create.Options {
+                store_only: cli.store_only,
+                deflate_limit: cli.max_deflate,
+                jobs: cli.jobs,
+                clock: clock
+            };
+            let s = create.create(out, list, o, progress)?;
+            if (!cli.quiet) {
+                eprint(
+                    "${out}: ${s.files} files, ${s.dirs} directories, ${s.bytes_in} → ${s.bytes_out} bytes (${pct(s.bytes_out, s.bytes_in)} saved)"
+                );
+            }
+            Result.Ok(0)
+        },
+        "x" => {
+            let a = archive.open(one_path(cli)?)?;
+            let r = extract.extract(
+                a,
+                extract.Options { dest: cli.dest, overwrite: cli.overwrite },
+                progress
+            );
+            archive.close_archive(a);
+            let s = r?;
+            if (!cli.quiet) {
+                eprint(
+                    "${s.files} files, ${s.dirs} directories, ${s.links} links, ${s.size} bytes"
+                );
+            }
+            Result.Ok(0)
+        },
+        "l" => {
+            let a = archive.open(one_path(cli)?)?;
+            list(a, clock);
+            archive.close_archive(a);
+            Result.Ok(0)
+        },
+        "t" => {
+            let path = one_path(cli)?;
+            let a = archive.open(path)?;
+            let r = extract.test(a, progress);
+            archive.close_archive(a);
+            for f in r.failed {
+                eprint("error: ${f}");
+            }
+            if (r.failed.len() > 0) {
+                return Result.Err(
+                    "${path}: ${r.failed.len()} of ${r.ok + r.failed.len()} entries failed"
+                );
+            }
+            print("${path}: ${r.ok} entries OK");
+            Result.Ok(0)
+        },
+        "gzip" => {
+            let src = one_path(cli)?;
+            let dst = if (cli.output == "") { "${src}.gz" } else { cli.output };
+            let (n_in, n_out) = gz.compress(src, dst, cli.jobs)?;
+            if (!cli.quiet) {
+                eprint("${dst}: ${n_in} → ${n_out} bytes (${pct(n_out, n_in)} saved)");
+            }
+            Result.Ok(0)
+        },
+        "gunzip" => {
+            let src = one_path(cli)?;
+            let dst = if (cli.output != "") {
+                cli.output
+            } else {
+                src.strip_suffix(".gz").ok_or("${src}: no .gz suffix (name the output with -c)")?
+            };
+            let (n_in, n_out) = gz.decompress(src, dst)?;
+            if (!cli.quiet) {
+                eprint("${dst}: ${n_in} → ${n_out} bytes");
+            }
+            Result.Ok(0)
+        },
+        _ => Result.Err("unknown command '${cli.command}'\n\n${USAGE}"),
+    }
+}
+
+fn one_path(cli: Cli) -> Result<string, string> {
+    if (cli.paths.len() != 1) {
+        return Result.Err("${cli.command} takes exactly one file");
+    }
+    Result.Ok(cli.paths[0])
+}
+
+fn main() -> int {
+    let argv = args();
+    if (argv.len() == 1 && argv[0] == "--version") {
+        print("rayzip ${VERSION}");
+        return 0;
+    }
+    match (parse_cli(argv)) {
+        Result.Ok(cli) => match (run(cli)) {
+            Result.Ok(_) => 0,
+            Result.Err(e) => {
+                eprint("rayzip: ${e}");
+                1
+            },
+        },
+        Result.Err(e) => {
+            eprint(e);
+            2
+        },
+    }
+}

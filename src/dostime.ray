@@ -1,0 +1,76 @@
+//! MS-DOS date and time, the ZIP header's timestamp: local time, two-second resolution, years
+//! 1980–2107. The zone comes from the `tz` package (the system's zone); without one, UTC.
+
+import std/time;
+import tz/tz;
+
+/// The zone timestamps are written and read in.
+pub struct Clock {
+    zone: Option<tz.Zone>,
+}
+
+/// The system's zone, or UTC if it cannot be read (no `/etc/localtime`, no `TZ`).
+pub fn system() -> Clock {
+    Clock { zone: tz.system().ok() }
+}
+
+pub fn utc() -> Clock {
+    Clock { zone: Option.None }
+}
+
+pub fn zone(name: string) -> Result<Clock, string> {
+    Result.Ok(Clock { zone: Option.Some(tz.load(name)?) })
+}
+
+fn offset(c: Clock, ms: int) -> int {
+    match (c.zone) {
+        Option.Some(z) => tz.offset_at(z, ms),
+        Option.None => 0,
+    }
+}
+
+/// The DOS (time, date) pair of an instant in epoch milliseconds, clamped to 1980–2107.
+pub fn encode(c: Clock, ms: int) -> (int, int) {
+    let t = time.from_epoch_millis(ms + offset(c, ms));
+    if (t.year < 1980) {
+        return (0, (1 << 5) | 1);
+    }
+    if (t.year > 2107) {
+        return ((23 << 11) | (59 << 5) | 29, (127 << 9) | (12 << 5) | 31);
+    }
+    let dos_time = (t.hour << 11) | (t.minute << 5) | (t.second / 2);
+    let dos_date = ((t.year - 1980) << 9) | (t.month << 5) | t.day;
+    (dos_time, dos_date)
+}
+
+/// The instant of a DOS (time, date) pair read in the clock's zone. A time that falls in a
+/// daylight-saving gap is read with the offset before the gap; one in the overlap, as the earlier.
+pub fn decode(c: Clock, dos_time: int, dos_date: int) -> int {
+    let civil = time.DateTime {
+        year: 1980 + (dos_date >> 9),
+        month: max_int((dos_date >> 5) & 15, 1),
+        day: max_int(dos_date & 31, 1),
+        hour: dos_time >> 11,
+        minute: (dos_time >> 5) & 63,
+        second: (dos_time & 31) * 2,
+        weekday: 0
+    };
+    let naive = time.to_epoch_millis(civil);
+    match (c.zone) {
+        Option.Some(z) => match (tz.to_utc(z, civil)) {
+            tz.LocalResult.Single(ms) => ms,
+            tz.LocalResult.Ambiguous(earlier, _) => earlier,
+            tz.LocalResult.Gap => naive - tz.offset_at(z, naive),
+        },
+        Option.None => naive,
+    }
+}
+
+fn max_int(a: int, b: int) -> int {
+    if (a > b) { a } else { b }
+}
+
+/// The civil time of an instant in the clock's zone (for display).
+pub fn local(c: Clock, ms: int) -> time.DateTime {
+    time.from_epoch_millis(ms + offset(c, ms))
+}

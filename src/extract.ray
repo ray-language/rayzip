@@ -1,0 +1,196 @@
+//! Extracting and testing. An archive is untrusted input: names that leave the destination
+//! (absolute, `..`, a symlink planted by an earlier entry) are refused, symlink entries may only
+//! point inside it, inflation stops at the declared size, and setuid/setgid bits are dropped.
+
+import std/fs;
+import archive;
+import format;
+from archive import Archive;
+from format import Entry;
+
+pub struct Options {
+    dest: string,
+    overwrite: bool,
+}
+
+pub struct Summary {
+    files: int,
+    dirs: int,
+    links: int,
+    size: int,
+}
+
+/// The relative path an entry name may be written to, or `Err` if it would escape.
+pub fn safe_path(name: string) -> Result<string, string> {
+    let n = name.replace("\\", "/");
+    if (n.starts_with("/")) {
+        return Result.Err("${name}: absolute path");
+    }
+    if (n.len() >= 2 && n[1] == ':') {
+        return Result.Err("${name}: drive letter");
+    }
+    let parts: [string] = [];
+    for p in n.split("/") {
+        if (p == "..") {
+            return Result.Err("${name}: '..' in the path");
+        }
+        if (p != "" && p != ".") {
+            parts.push(p);
+        }
+    }
+    if (parts.len() == 0) {
+        return Result.Err("${name}: empty name");
+    }
+    Result.Ok(join(parts, "/"))
+}
+
+/// Whether a symlink at `rel` (relative to the destination) pointing to `target` stays inside
+/// the destination, resolving the target lexically.
+pub fn link_stays_inside(rel: string, target: string) -> bool {
+    if (target.starts_with("/") || target.contains("\\") || target == "") {
+        return false;
+    }
+    let parts = rel.split("/");
+    let stack: [string] = [];
+    for i in 0..parts.len() - 1 {
+        stack.push(parts[i]);
+    }
+    for p in target.split("/") {
+        if (p == "..") {
+            if (stack.len() == 0) {
+                return false;
+            }
+            let _ = stack.pop();
+        } else if (p != "" && p != ".") {
+            stack.push(p);
+        }
+    }
+    true
+}
+
+fn parent_of(rel: string) -> string {
+    match (rel.last_index_of("/")) {
+        Option.Some(i) => rel.substring(0, i),
+        Option.None => "",
+    }
+}
+
+/// Creates the entry's parent directories and checks that, after resolving every symlink
+/// already on disk, the parent is still inside the destination.
+fn prepare_parent(dest: string, rel: string) -> Result<string, string> {
+    let parent = parent_of(rel);
+    let dir = if (parent == "") { dest } else { "${dest}/${parent}" };
+    fs.mkdir(dir)?;
+    if (!fs.is_within_real(dir, dest)?) {
+        return Result.Err(
+            "${rel}: its directory leads outside the destination (through a symlink)"
+        );
+    }
+    Result.Ok(dir)
+}
+
+fn write_file(a: Archive, e: Entry, path: string) -> Result<int, string> {
+    let h = fs.open(path, "w")?;
+    let r = archive.read_entry(a, e, fn(chunk: bytes) -> Result<int, string> {
+        fs.write_bytes(h, chunk)
+    });
+    close(h);
+    if (r.is_err()) {
+        let _ = fs.remove_file(path);
+    }
+    r
+}
+
+fn read_all(a: Archive, e: Entry) -> Result<bytes, string> {
+    let parts: [bytes] = [];
+    archive.read_entry(a, e, fn(chunk: bytes) -> Result<int, string> {
+        parts.push(chunk);
+        Result.Ok(chunk.len())
+    })?;
+    Result.Ok(bytes_concat(parts))
+}
+
+/// Extracts every entry under `o.dest`; `progress` is called with each entry's name. Stops at
+/// the first error.
+pub fn extract(a: Archive, o: Options, progress: fn(string)) -> Result<Summary, string> {
+    fs.mkdir(o.dest)?;
+    let dest = fs.real_path(o.dest)?;
+    let sum = Summary { files: 0, dirs: 0, links: 0, size: 0 };
+    // Directory modes go last: a read-only directory would stop its own entries.
+    let dirs: [(string, Entry)] = [];
+    for e in a.entries {
+        let rel = safe_path(e.name)?;
+        let path = "${dest}/${rel}";
+        progress(e.name);
+        if (e.is_dir) {
+            prepare_parent(dest, rel)?;
+            fs.mkdir(path)?;
+            if (!fs.is_within_real(path, dest)?) {
+                return Result.Err("${e.name}: leads outside the destination (through a symlink)");
+            }
+            dirs.push((path, e));
+            sum.dirs = sum.dirs + 1;
+            continue;
+        }
+        prepare_parent(dest, rel)?;
+        if (fs.stat(path).is_ok()) {
+            if (!o.overwrite) {
+                return Result.Err("${rel}: already exists (use -o to overwrite)");
+            }
+            // Never write through whatever is there (a symlink would redirect the write).
+            fs.remove_file(path)?;
+        }
+        if (format.is_symlink(e)) {
+            let target = format.text_of(read_all(a, e)?);
+            if (!link_stays_inside(rel, target)) {
+                return Result.Err(
+                    "${e.name}: symlink to '${target}' leads outside the destination"
+                );
+            }
+            fs.symlink(target, path)?;
+            sum.links = sum.links + 1;
+            continue;
+        }
+        sum.size = sum.size + write_file(a, e, path)?;
+        restore_mode(path, e)?;
+        sum.files = sum.files + 1;
+    }
+    var i = dirs.len();
+    while (i > 0) {
+        i = i - 1;
+        let (path, e) = dirs[i];
+        restore_mode(path, e)?;
+    }
+    Result.Ok(sum)
+}
+
+/// The permission bits only: setuid, setgid and sticky never come out of an archive.
+fn restore_mode(path: string, e: Entry) -> Result<int, string> {
+    let perm = format.permissions(e);
+    if (perm != 0 && platform() != "windows") {
+        fs.chmod(path, perm)?;
+    }
+    Result.Ok(0)
+}
+
+pub struct Report {
+    ok: int,
+    failed: [string],
+}
+
+/// Reads and verifies every entry (size and CRC-32) without writing anything.
+pub fn test(a: Archive, progress: fn(string)) -> Report {
+    let r = Report { ok: 0, failed: [] };
+    for e in a.entries {
+        progress(e.name);
+        if (e.is_dir) {
+            r.ok = r.ok + 1;
+            continue;
+        }
+        match (archive.read_entry(a, e, fn(chunk: bytes) -> Result<int, string> { Result.Ok(chunk.len()) })) {
+            Result.Ok(_) => r.ok = r.ok + 1,
+            Result.Err(m) => r.failed.push(m),
+        }
+    }
+    r
+}

@@ -1,0 +1,220 @@
+// Create → read → extract, with `std/zip` as the independent reader of what rayzip writes.
+
+import std/fs;
+import std/zip;
+import archive;
+import create;
+import dostime;
+import extract;
+import format;
+import sources;
+
+fn text_block(n: int) -> string {
+    var s = "";
+    var i = 0;
+    while (s.len() < n) {
+        s = s + "line ${i}: the quick brown fox jumps over the lazy dog\n";
+        i = i + 1;
+    }
+    s
+}
+
+fn noise(n: int, seed: int) -> bytes {
+    let xs: [int] = [];
+    var x = seed;
+    for _ in 0..n {
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF;
+        xs.push((x >> 16) & 0xFF);
+    }
+    bytes_of(xs)
+}
+
+/// A small tree: text that compresses, noise that does not, an empty file, a nested directory
+/// and a non-ASCII name.
+fn tree() -> string {
+    let root = fs.make_temp_dir("rayzip-tree").unwrap();
+    fs.mkdir("${root}/in/sub/deep").unwrap();
+    fs.write_file("${root}/in/a.txt", text_block(50000)).unwrap();
+    fs.write_file_bytes("${root}/in/sub/noise.bin", noise(70000, 7)).unwrap();
+    fs.write_file("${root}/in/empty", "").unwrap();
+    fs.write_file("${root}/in/sub/deep/ñandú.txt", "ñandú\n").unwrap();
+    fs.chmod("${root}/in/a.txt", 0o640).unwrap();
+    root
+}
+
+fn options(jobs: int) -> create.Options {
+    create.Options {
+        store_only: false,
+        deflate_limit: 512 * 1024 * 1024,
+        jobs: jobs,
+        clock: dostime.utc()
+    }
+}
+
+fn quiet(name: string) { }
+
+fn build(root: string, o: create.Options) -> string {
+    let path = "${root}/out.zip";
+    let list = sources.collect(["${root}/in"], "").unwrap();
+    create.create(path, list, o, quiet).unwrap();
+    path
+}
+
+fn names(a: archive.Archive) -> [string] {
+    a.entries.map(fn(e: format.Entry) -> string { e.name })
+}
+
+fn suffix(names: [string], root: string) -> [string] {
+    let prefix = sources.archive_name(root) + "/";
+    names.map(fn(n: string) -> string { n.strip_prefix(prefix).unwrap_or(n) })
+}
+
+@test
+fn the_walk_is_sorted_and_names_are_relative() {
+    let root = tree();
+    let list = sources.collect(["${root}/in"], "").unwrap();
+    let got = suffix(list.map(fn(s: sources.Source) -> string { s.name }), root);
+    assert_eq(
+        got,
+        [
+            "in/",
+            "in/a.txt",
+            "in/empty",
+            "in/sub/",
+            "in/sub/deep/",
+            "in/sub/deep/ñandú.txt",
+            "in/sub/noise.bin"
+        ]
+    );
+    assert_eq(sources.archive_name("./x/../y//z"), "x/y/z");
+    assert_eq(sources.archive_name("/abs/path"), "abs/path");
+    fs.remove_all(root).unwrap();
+}
+
+fn check_archive(root: string, path: string) {
+    let a = archive.open(path).unwrap();
+    assert_eq(a.entries.len(), 7);
+    // std/zip, reading the same archive in memory, agrees on every entry and its bytes.
+    let z = zip.open(fs.read_file_bytes(path).unwrap()).unwrap();
+    assert_eq(zip.entries(z).len(), 7);
+    for e in a.entries {
+        let ze = zip.find(z, e.name).unwrap();
+        assert_eq(ze.size, e.size);
+        assert_eq(ze.crc32, e.crc);
+        assert_eq(ze.method, e.method);
+        if (!e.is_dir) {
+            let parts: [bytes] = [];
+            archive.read_entry(a, e, fn(chunk: bytes) -> Result<int, string> {
+                parts.push(chunk);
+                Result.Ok(0)
+            }).unwrap();
+            assert_eq(bytes_concat(parts), zip.read_entry(z, ze).unwrap());
+        }
+    }
+    let noise = a.entries.filter(fn(e: format.Entry) -> bool { e.name.ends_with("noise.bin") })[0];
+    // Noise does not compress: stored.
+    assert_eq(noise.method, format.STORED);
+    let text = a.entries.filter(fn(e: format.Entry) -> bool { e.name.ends_with("a.txt") })[0];
+    assert_eq(text.method, format.DEFLATED);
+    assert(text.compressed * 10 < text.size);
+    assert_eq(format.permissions(text), 0o640);
+    archive.close_archive(a);
+}
+
+@test
+fn one_worker_and_several_write_the_same_archive() {
+    let root = tree();
+    let path = build(root, options(1));
+    check_archive(root, path);
+    let one = fs.read_file_bytes(path).unwrap();
+    fs.remove_file(path).unwrap();
+    let path3 = build(root, options(3));
+    check_archive(root, path3);
+    assert_eq(fs.read_file_bytes(path3).unwrap(), one);
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn extraction_restores_contents_and_modes() {
+    let root = tree();
+    let path = build(root, options(2));
+    let a = archive.open(path).unwrap();
+    let dest = "${root}/x";
+    let s = extract.extract(a, extract.Options { dest: dest, overwrite: false }, quiet).unwrap();
+    assert_eq(s.files, 4);
+    assert_eq(s.dirs, 3);
+    let base = "${dest}/${sources.archive_name(root)}/in";
+    assert_eq(fs.read_file("${base}/a.txt").unwrap(), text_block(50000));
+    assert_eq(fs.read_file_bytes("${base}/sub/noise.bin").unwrap(), noise(70000, 7));
+    assert_eq(fs.read_file("${base}/sub/deep/ñandú.txt").unwrap(), "ñandú\n");
+    assert_eq(fs.read_file("${base}/empty").unwrap(), "");
+    assert_eq(fs.stat("${base}/a.txt").unwrap().mode & 0o777, 0o640);
+    // A second extraction refuses to overwrite, unless asked.
+    assert(extract.extract(a, extract.Options { dest: dest, overwrite: false }, quiet).is_err());
+    assert(extract.extract(a, extract.Options { dest: dest, overwrite: true }, quiet).is_ok());
+    archive.close_archive(a);
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn big_entries_take_the_streaming_paths() {
+    let root = tree();
+    // Over the deflate limit: stored in chunks with the CRC patched in afterwards.
+    let o = options(1);
+    o.deflate_limit = 1000;
+    let path = build(root, o);
+    let a = archive.open(path).unwrap();
+    let text = a.entries.filter(fn(e: format.Entry) -> bool { e.name.ends_with("a.txt") })[0];
+    assert_eq(text.method, format.STORED);
+    let z = zip.open(fs.read_file_bytes(path).unwrap()).unwrap();
+    assert_eq(zip.read(z, text.name).unwrap(), text_block(50000).to_bytes());
+    archive.close_archive(a);
+    fs.remove_file(path).unwrap();
+    // A deflated entry read through the streaming inflater instead of in one call.
+    let path2 = build(root, options(1));
+    let b = archive.open(path2).unwrap();
+    let t2 = b.entries.filter(fn(e: format.Entry) -> bool { e.name.ends_with("a.txt") })[0];
+    let parts: [bytes] = [];
+    archive.read_entry_with(b, t2, 0, fn(chunk: bytes) -> Result<int, string> {
+        parts.push(chunk);
+        Result.Ok(0)
+    }).unwrap();
+    assert_eq(bytes_concat(parts), text_block(50000).to_bytes());
+    archive.close_archive(b);
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn test_catches_a_flipped_byte() {
+    let root = tree();
+    let o = options(1);
+    o.store_only = true;
+    let path = build(root, o);
+    let a = archive.open(path).unwrap();
+    let text = a.entries.filter(fn(e: format.Entry) -> bool { e.name.ends_with("a.txt") })[0];
+    archive.close_archive(a);
+    // Flip one byte in the middle of a.txt's stored data.
+    let data = fs.read_file_bytes(path).unwrap();
+    let at = text.offset + 30 + text.name.to_bytes().len() + 9 + 100;
+    let flipped = bytes_concat(
+        [data.sub_bytes(0, at), bytes_of([data[at] ^ 1]), data.sub_bytes(at + 1, data.len())]
+    );
+    fs.write_file_bytes(path, flipped).unwrap();
+    let b = archive.open(path).unwrap();
+    let r = extract.test(b, quiet);
+    assert_eq(r.failed.len(), 1);
+    assert(r.failed[0].contains("CRC-32 mismatch"));
+    archive.close_archive(b);
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn the_archive_never_goes_into_itself() {
+    let root = tree();
+    let path = "${root}/in/self.zip";
+    fs.write_file(path, "old").unwrap();
+    let list = sources.collect(["${root}/in"], fs.real_path(path).unwrap()).unwrap();
+    let inside = list.filter(fn(s: sources.Source) -> bool { s.name.ends_with("self.zip") });
+    assert_eq(inside.len(), 0);
+    fs.remove_all(root).unwrap();
+}

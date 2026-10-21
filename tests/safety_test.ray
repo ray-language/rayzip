@@ -1,0 +1,241 @@
+// Hostile archives: names that leave the destination, symlinks that point out of it or that
+// earlier entries plant on the way, and entries that inflate past their declared size.
+
+import std/collections/bytesbuilder;
+import std/deflate;
+import std/fs;
+import std/inflate;
+import archive;
+import extract;
+import format;
+from format import Entry;
+
+/// One entry for `forge`: a name, its data, its st_mode and whether to deflate it.
+struct Item {
+    name: string,
+    data: bytes,
+    mode: int,
+    deflated: bool,
+}
+
+fn file(name: string, data: string) -> Item {
+    Item { name: name, data: data.to_bytes(), mode: format.file_mode(0o644), deflated: false }
+}
+
+fn link(name: string, target: string) -> Item {
+    Item { name: name, data: target.to_bytes(), mode: 0xA000 | 0o777, deflated: false }
+}
+
+fn dir(name: string) -> Item {
+    Item { name: name, data: b"", mode: format.dir_mode(0o755), deflated: false }
+}
+
+/// Writes an archive with exactly these entries, whatever their names say.
+fn forge(path: string, items: [Item]) {
+    let body = bytesbuilder.new();
+    let central = bytesbuilder.new();
+    for it in items {
+        let payload = if (it.deflated) { deflate.deflate_raw(it.data) } else { it.data };
+        let e = Entry {
+            name: it.name,
+            method: if (it.deflated) { format.DEFLATED } else { format.STORED },
+            flags: 0,
+            crc: inflate.crc32(it.data),
+            compressed: payload.len(),
+            size: it.data.len(),
+            offset: bytesbuilder.len(body),
+            dos_time: 0,
+            dos_date: 0x21,
+            unix_time: Option.None,
+            mode: it.mode,
+            is_dir: it.name.ends_with("/")
+        };
+        bytesbuilder.push(body, format.local_header(e));
+        bytesbuilder.push(body, payload);
+        bytesbuilder.push(central, format.central_header(e));
+    }
+    let cd = bytesbuilder.build(central);
+    let at = bytesbuilder.len(body);
+    bytesbuilder.push(body, cd);
+    bytesbuilder.push(body, format.end_records(items.len(), at, cd.len()));
+    fs.write_file_bytes(path, bytesbuilder.build(body)).unwrap();
+}
+
+fn quiet(name: string) { }
+
+/// Extracts `items` into a fresh directory; returns the error, if any, and the sandbox root.
+fn try_extract(items: [Item]) -> (Result<int, string>, string) {
+    let root = fs.make_temp_dir("rayzip-safety").unwrap();
+    forge("${root}/evil.zip", items);
+    let a = archive.open("${root}/evil.zip").unwrap();
+    let r = extract.extract(a, extract.Options { dest: "${root}/dest", overwrite: false }, quiet);
+    archive.close_archive(a);
+    (r.map(fn(s: extract.Summary) -> int { s.files }), root)
+}
+
+fn refused(items: [Item], why: string) {
+    let (r, root) = try_extract(items);
+    match (r) {
+        Result.Ok(_) => panic("extracted, but it should have been refused (${why})"),
+        Result.Err(m) => assert(m.contains(why)),
+    }
+    // Nothing escaped next to the destination.
+    assert(!fs.exists("${root}/outside"));
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn names_that_climb_out_are_refused() {
+    refused([file("../outside", "x")], "'..'");
+    refused([file("a/../../outside", "x")], "'..'");
+    refused([file("/tmp/outside", "x")], "absolute");
+    refused([file("C:/outside", "x")], "drive letter");
+    refused([file("a\\..\\..\\outside", "x")], "'..'");
+}
+
+@test
+fn harmless_odd_names_are_normalized() {
+    assert_eq(extract.safe_path("./a//b/./c"), Result.Ok("a/b/c"));
+    assert(extract.safe_path("").is_err());
+    assert(extract.safe_path("./").is_err());
+}
+
+@test
+fn symlinks_pointing_out_are_refused() {
+    refused([link("l", "../outside")], "leads outside");
+    refused([link("l", "/etc/passwd")], "leads outside");
+    refused([dir("d/"), link("d/l", "../../outside")], "leads outside");
+}
+
+@test
+fn a_planted_symlink_cannot_redirect_later_entries() {
+    // An entry that is a symlink to an allowed place inside, then a file through a link that
+    // was replaced by one pointing out: here, a link to the destination's parent made by hand.
+    let (r, root) = try_extract([dir("d/"), link("d/up", "..")]);
+    assert(r.is_ok());
+    fs.remove_all(root).unwrap();
+    // The archive itself cannot climb, but a symlink already on disk can: a later entry
+    // written through it must be refused.
+    let root2 = fs.make_temp_dir("rayzip-safety").unwrap();
+    fs.mkdir("${root2}/dest").unwrap();
+    fs.mkdir("${root2}/outside").unwrap();
+    fs.symlink("../outside", "${root2}/dest/esc").unwrap();
+    forge("${root2}/evil.zip", [file("esc/payload", "x")]);
+    let a = archive.open("${root2}/evil.zip").unwrap();
+    let r2 = extract.extract(a, extract.Options { dest: "${root2}/dest", overwrite: false }, quiet);
+    archive.close_archive(a);
+    assert(r2.is_err());
+    assert(!fs.exists("${root2}/outside/payload"));
+    fs.remove_all(root2).unwrap();
+}
+
+@test
+fn symlinks_inside_are_restored() {
+    let (r, root) = try_extract(
+        [dir("d/"), file("d/f", "hello"), link("d/l", "f"), link("up", "d/f")]
+    );
+    assert(r.is_ok());
+    assert_eq(fs.stat("${root}/dest/d/l").unwrap().kind, "symlink");
+    assert_eq(fs.read_file("${root}/dest/d/l").unwrap(), "hello");
+    assert_eq(fs.read_file("${root}/dest/up").unwrap(), "hello");
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn an_existing_symlink_is_replaced_not_written_through() {
+    let root = fs.make_temp_dir("rayzip-safety").unwrap();
+    fs.mkdir("${root}/dest").unwrap();
+    fs.write_file("${root}/victim", "keep").unwrap();
+    fs.symlink("../victim", "${root}/dest/f").unwrap();
+    forge("${root}/a.zip", [file("f", "new")]);
+    let a = archive.open("${root}/a.zip").unwrap();
+    extract.extract(a, extract.Options { dest: "${root}/dest", overwrite: true }, quiet).unwrap();
+    archive.close_archive(a);
+    assert_eq(fs.read_file("${root}/victim").unwrap(), "keep");
+    assert_eq(fs.read_file("${root}/dest/f").unwrap(), "new");
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn setuid_bits_are_dropped() {
+    let it = file("f", "x");
+    it.mode = format.file_mode(0o4755);
+    let (r, root) = try_extract([it]);
+    assert(r.is_ok());
+    assert_eq(fs.stat("${root}/dest/f").unwrap().mode & 0o7777, 0o755);
+    fs.remove_all(root).unwrap();
+}
+
+/// An entry that says it holds 1000 bytes but inflates to a megabyte (a zip bomb's lie).
+fn bomb(path: string) {
+    let zeros: [int] = [];
+    for _ in 0..1048576 {
+        zeros.push(0);
+    }
+    let data = bytes_of(zeros);
+    let payload = deflate.deflate_raw(data);
+    let e = Entry {
+        name: "bomb",
+        method: format.DEFLATED,
+        flags: 0,
+        crc: inflate.crc32(data),
+        compressed: payload.len(),
+        size: 1000,
+        offset: 0,
+        dos_time: 0,
+        dos_date: 0x21,
+        unix_time: Option.None,
+        mode: format.file_mode(0o644),
+        is_dir: false
+    };
+    let b = bytesbuilder.new();
+    bytesbuilder.push(b, format.local_header(e));
+    bytesbuilder.push(b, payload);
+    let cd = format.central_header(e);
+    let at = bytesbuilder.len(b);
+    bytesbuilder.push(b, cd);
+    bytesbuilder.push(b, format.end_records(1, at, cd.len()));
+    fs.write_file_bytes(path, bytesbuilder.build(b)).unwrap();
+}
+
+@test
+fn inflation_stops_at_the_declared_size() {
+    let root = fs.make_temp_dir("rayzip-safety").unwrap();
+    bomb("${root}/bomb.zip");
+    let a = archive.open("${root}/bomb.zip").unwrap();
+    let e = a.entries[0];
+    var produced = 0;
+    let sink = fn(chunk: bytes) -> Result<int, string> {
+        produced = produced + chunk.len();
+        Result.Ok(0)
+    };
+    // In one call and through the streaming decoder.
+    assert(archive.read_entry(a, e, sink).is_err());
+    assert(archive.read_entry_with(a, e, 0, sink).is_err());
+    assert(produced <= 1000);
+    archive.close_archive(a);
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn truncated_and_garbage_archives_fail_cleanly() {
+    let root = fs.make_temp_dir("rayzip-safety").unwrap();
+    forge("${root}/ok.zip", [file("a", "hello"), file("b", "world")]);
+    let data = fs.read_file_bytes("${root}/ok.zip").unwrap();
+    // Every truncation either fails to open or fails to read; none panics.
+    var cut = 0;
+    while (cut < data.len()) {
+        fs.write_file_bytes("${root}/cut.zip", data.sub_bytes(0, cut)).unwrap();
+        match (archive.open("${root}/cut.zip")) {
+            Result.Ok(a) => {
+                let _ = extract.test(a, quiet);
+                archive.close_archive(a);
+            },
+            Result.Err(_) => { },
+        }
+        cut = cut + 7;
+    }
+    fs.write_file("${root}/text.zip", "not a zip at all").unwrap();
+    assert(archive.open("${root}/text.zip").is_err());
+    fs.remove_all(root).unwrap();
+}
