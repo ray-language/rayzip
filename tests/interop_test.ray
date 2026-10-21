@@ -65,7 +65,9 @@ fn unzip_reads_what_rayzip_writes() {
     sh("mkdir '${root}/u' && cd '${root}/u' && unzip -q '${root}/r.zip'");
     let base = "${root}/u/${sources.archive_name(root)}/in";
     sh("diff -r '${base}' '${root}/in'");
-    assert_eq(fs.stat("${base}/rows.csv").unwrap().mode & 0o777, 0o600);
+    if (platform() != "windows") {
+        assert_eq(fs.stat("${base}/rows.csv").unwrap().mode & 0o777, 0o600);
+    }
     fs.remove_all(root).unwrap();
 }
 
@@ -91,7 +93,9 @@ fn rayzip_reads_what_zip_writes() {
     archive.close_archive(a);
     sh("diff -r '${root}/x/in' '${root}/in'");
     assert_eq(fs.stat("${root}/x/in/link").unwrap().kind, "symlink");
-    assert_eq(fs.stat("${root}/x/in/rows.csv").unwrap().mode & 0o777, 0o600);
+    if (platform() != "windows") {
+        assert_eq(fs.stat("${root}/x/in/rows.csv").unwrap().mode & 0o777, 0o600);
+    }
     fs.remove_all(root).unwrap();
 }
 
