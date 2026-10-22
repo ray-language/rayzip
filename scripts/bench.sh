@@ -38,8 +38,9 @@ done
 echo "$(measure zip -qr pz.zip many)  zip -r"
 
 echo "== one file of 256 MiB"
-echo "$(measure "$RZ" c b1.zip big.txt -q)  rayzip c (deflated in memory)"
-echo "$(measure "$RZ" c b2.zip big.txt -q --max-deflate 100M)  rayzip c --max-deflate 100M (stored, streamed)"
+echo "$(measure "$RZ" c b1.zip big.txt -q)  rayzip c (deflated in chunks)"
+echo "$(measure "$RZ" c b2.zip big.txt -q --max-deflate 1G)  rayzip c --max-deflate 1G (deflated whole, in memory)"
+echo "$(measure "$RZ" c b3.zip big.txt -q -0)  rayzip c -0 (stored, in chunks)"
 echo "$(measure zip -q bz.zip big.txt)  zip"
 echo "$(measure "$RZ" t b1.zip -q)  rayzip t"
 echo "$(measure unzip -tq b1.zip)  unzip -t"
@@ -49,4 +50,4 @@ echo "$(measure "$RZ" gunzip big.gz -c big.out -q)  rayzip gunzip (its own membe
 echo "$(measure "$RZ" gunzip bigg.gz -c bigg.out -q)  rayzip gunzip (gzip's single member)"
 echo "$(measure sh -c 'gzip -dc bigg.gz > /dev/null')  gzip -d"
 cmp big.out big.txt && cmp bigg.out big.txt && echo "round trips identical"
-echo "compressed: $(wc -c < b1.zip) (rayzip zip), $(wc -c < bz.zip) (zip), $(wc -c < big.gz) (rayzip gzip), $(wc -c < bigg.gz) (gzip)"
+echo "compressed: $(wc -c < b1.zip) (rayzip zip, chunks), $(wc -c < b2.zip) (rayzip zip, whole), $(wc -c < bz.zip) (zip), $(wc -c < big.gz) (rayzip gzip), $(wc -c < bigg.gz) (gzip)"

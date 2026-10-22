@@ -1,9 +1,11 @@
 //! Extracting and testing. An archive is untrusted input: names that leave the destination
 //! (absolute, `..`, a symlink planted by an earlier entry) are refused, symlink entries may only
 //! point inside it, inflation stops at the declared size, and setuid/setgid bits are dropped.
+//! Files and directories get back their modification time.
 
 import std/fs;
 import archive;
+import dostime;
 import format;
 from archive import Archive;
 from format import Entry;
@@ -68,6 +70,15 @@ pub fn link_stays_inside(rel: string, target: string) -> bool {
     true
 }
 
+/// When the entry was last modified (epoch ms): the extended-timestamp field, which is UTC, or
+/// else the DOS time read in `clock`'s zone.
+pub fn modified_ms(e: Entry, clock: dostime.Clock) -> int {
+    match (e.unix_time) {
+        Option.Some(s) => s * 1000,
+        Option.None => dostime.decode(clock, e.dos_time, e.dos_date),
+    }
+}
+
 fn parent_of(rel: string) -> string {
     match (rel.last_index_of("/")) {
         Option.Some(i) => rel.substring(0, i),
@@ -116,7 +127,9 @@ pub fn extract(a: Archive, o: Options, progress: fn(string)) -> Result<Summary, 
     fs.mkdir(o.dest)?;
     let dest = fs.real_path(o.dest)?;
     let sum = Summary { files: 0, dirs: 0, links: 0, size: 0 };
-    // Directory modes go last: a read-only directory would stop its own entries.
+    let clock = dostime.system();
+    // Directory modes and times go last: a read-only directory would stop its own entries, and
+    // writing them changes its time.
     let dirs: [(string, Entry)] = [];
     for e in a.entries {
         let rel = safe_path(e.name)?;
@@ -153,6 +166,7 @@ pub fn extract(a: Archive, o: Options, progress: fn(string)) -> Result<Summary, 
         }
         sum.size = sum.size + write_file(a, e, path)?;
         restore_mode(path, e)?;
+        fs.set_mtime(path, modified_ms(e, clock))?;
         sum.files = sum.files + 1;
     }
     var i = dirs.len();
@@ -160,6 +174,7 @@ pub fn extract(a: Archive, o: Options, progress: fn(string)) -> Result<Summary, 
         i = i - 1;
         let (path, e) = dirs[i];
         restore_mode(path, e)?;
+        fs.set_mtime(path, modified_ms(e, clock))?;
     }
     Result.Ok(sum)
 }

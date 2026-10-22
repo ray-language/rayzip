@@ -32,8 +32,10 @@ options:
   -d DIR           extract into DIR (default: the current directory)
   -o               overwrite existing files when extracting
   -0               store only, no compression
+  -y               store symlinks as links instead of following them
   -j N             compression workers (default: one per core)
-  --max-deflate S  files bigger than S are stored, not deflated (default 512M; K, M, G)
+  --max-deflate S  files bigger than S are deflated in chunks by the writer, not whole in
+                   memory by the workers (default 64M; K, M, G)
   -c OUT           gzip/gunzip: write to OUT
   -q               quiet
   --version`;
@@ -44,6 +46,7 @@ struct Cli {
     dest: string,
     overwrite: bool,
     store_only: bool,
+    links: bool,
     jobs: int,
     max_deflate: int,
     output: string,
@@ -75,8 +78,9 @@ fn parse_cli(argv: [string]) -> Result<Cli, string> {
         dest: ".",
         overwrite: false,
         store_only: false,
+        links: false,
         jobs: worker_count(),
-        max_deflate: units.mb(512),
+        max_deflate: units.mb(64),
         output: "",
         quiet: false
     };
@@ -102,6 +106,8 @@ fn parse_cli(argv: [string]) -> Result<Cli, string> {
             cli.overwrite = true;
         } else if (a == "-0") {
             cli.store_only = true;
+        } else if (a == "-y") {
+            cli.links = true;
         } else if (a == "-q") {
             cli.quiet = true;
         } else if (a.starts_with("-") && a != "-") {
@@ -131,11 +137,7 @@ fn list(a: archive.Archive, clock: dostime.Clock) {
     var size = 0;
     var packed = 0;
     for e in a.entries {
-        let ms = match (e.unix_time) {
-            Option.Some(s) => s * 1000,
-            Option.None => dostime.decode(clock, e.dos_time, e.dos_date),
-        };
-        let t = dostime.local(clock, ms);
+        let t = dostime.local(clock, extract.modified_ms(e, clock));
         let method = if (e.method == format.DEFLATED) {
             "Defl"
         } else if (e.method == format.STORED) {
@@ -183,7 +185,7 @@ fn run(cli: Cli) -> Result<int, string> {
             let inputs = cli.paths.slice(1, cli.paths.len());
             // The archive is written as `out.rayzip-tmp` until it is complete.
             let skip = if (fs.exists(out)) { fs.real_path(out)? } else { "" };
-            let list = sources.collect(inputs, skip)?;
+            let list = sources.collect_with(inputs, skip, cli.links)?;
             let o = create.Options {
                 store_only: cli.store_only,
                 deflate_limit: cli.max_deflate,

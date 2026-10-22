@@ -1,7 +1,7 @@
-//! Writing an archive. Each file is read whole, summed and deflated in memory (`std/deflate`
-//! has no streaming compressor), by `jobs` worker fibers in parallel; the writer puts them in
-//! the archive in order. Files over `deflate_limit` are stored instead, streamed in chunks with
-//! the CRC patched into the local header afterwards, so memory stays bounded.
+//! Writing an archive. Each file is read whole, summed and deflated in memory by `jobs` worker
+//! fibers in parallel; the writer puts them in the archive in order. Files over `deflate_limit`
+//! are deflated by the writer itself, chunk by chunk (`deflate_raw_chunk`), with the CRC and the
+//! compressed size patched into the local header afterwards, so memory stays bounded.
 
 import std/collections/bytesbuilder;
 import std/deflate;
@@ -9,6 +9,7 @@ import std/fs;
 import std/inflate;
 import dostime;
 import format;
+import le;
 import sources;
 from format import Entry;
 from sources import Source;
@@ -46,6 +47,9 @@ struct Job {
 }
 
 const CHUNK: int = 1024 * 1024;
+
+/// The compression level of `deflate_raw`.
+const LEVEL: int = 6;
 
 fn pack(index: int, path: string, store_only: bool) -> Packed {
     match (fs.read_file_bytes(path)) {
@@ -118,13 +122,19 @@ fn entry_for(s: Source, o: Options, offset: int) -> Entry {
         dos_time: t,
         dos_date: d,
         unix_time: Option.Some(s.mtime_ms / 1000),
-        mode: if (s.is_dir) { format.dir_mode(s.perm) } else { format.file_mode(s.perm) },
+        mode: if (s.is_dir) {
+            format.dir_mode(s.perm)
+        } else if (s.link != "") {
+            format.link_mode(s.perm)
+        } else {
+            format.file_mode(s.perm)
+        },
         is_dir: s.is_dir
     }
 }
 
 fn deflatable(s: Source, o: Options) -> bool {
-    !s.is_dir && s.size <= o.deflate_limit
+    !s.is_dir && s.link == "" && s.size <= o.deflate_limit
 }
 
 /// The writer's state: the output handle, where it is and the central directory so far.
@@ -156,52 +166,100 @@ fn add(out: Out, e: Entry, payload: bytes) -> Result<int, string> {
     Result.Ok(0)
 }
 
-/// A big file, stored in chunks; the CRC is only known at the end and goes back into the
-/// local header (at offset 14).
-fn add_streamed(out: Out, s: Source, e: Entry) -> Result<int, string> {
-    e.compressed = s.size;
-    let header_at = out.offset;
-    put(out, format.local_header(e))?;
-    let src = fs.open(s.path, "r")?;
-    var sum = 0;
-    var copied = 0;
-    var failed = "";
-    while (failed == "") {
-        match (fs.read_bytes(src, CHUNK)) {
-            Result.Ok(Option.Some(chunk)) => {
-                sum = inflate.crc32_update(sum, chunk);
-                copied = copied + chunk.len();
-                match (put(out, chunk)) {
-                    Result.Ok(_) => { },
-                    Result.Err(m) => failed = m,
-                }
-            },
-            Result.Ok(Option.None) => break,
-            Result.Err(m) => failed = "${s.path}: ${m}",
-        }
-    }
-    close(src);
-    if (failed != "") {
-        return Result.Err(failed);
-    }
-    if (copied != s.size) {
-        return Result.Err("${s.path}: changed while being read (${copied} bytes, not ${s.size})");
-    }
-    e.crc = sum;
+/// The local header's CRC (at offset 14) and compressed size, known only once the data is
+/// written: in the 32-bit slot at 18, or in the ZIP64 extra field that follows the name.
+fn patch_header(out: Out, header_at: int, e: Entry, compressed: bool) -> Result<int, string> {
     let end = out.offset;
     fs.seek(out.h, header_at + 14)?;
-    let patch = bytesbuilder.new();
-    bytesbuilder.push_byte(patch, e.crc & 0xFF);
-    bytesbuilder.push_byte(patch, (e.crc >> 8) & 0xFF);
-    bytesbuilder.push_byte(patch, (e.crc >> 16) & 0xFF);
-    bytesbuilder.push_byte(patch, (e.crc >> 24) & 0xFF);
-    fs.write_bytes(out.h, bytesbuilder.build(patch))?;
+    let crc = bytesbuilder.new();
+    le.put_u32(crc, e.crc);
+    fs.write_bytes(out.h, bytesbuilder.build(crc))?;
+    if (compressed) {
+        let size = bytesbuilder.new();
+        if (e.size >= format.MAX32) {
+            fs.seek(out.h, header_at + format.LOCAL_LEN + e.name.to_bytes().len() + 12)?;
+            le.put_u64(size, e.compressed);
+        } else {
+            fs.seek(out.h, header_at + 18)?;
+            le.put_u32(size, e.compressed);
+        }
+        fs.write_bytes(out.h, bytesbuilder.build(size))?;
+    }
     fs.seek(out.h, end)?;
+    Result.Ok(0)
+}
+
+/// A big file, in chunks: deflated if its first chunk shrinks, stored if not (already
+/// compressed). The CRC and the compressed size go back into the local header at the end.
+fn add_streamed(out: Out, s: Source, e: Entry, o: Options) -> Result<int, string> {
+    let src = fs.open(s.path, "r")?;
+    let r = stream_into(out, s, e, o, src);
+    close(src);
+    r?;
     bytesbuilder.push(out.central, format.central_header(e));
     out.count = out.count + 1;
     out.summary.files = out.summary.files + 1;
     out.summary.bytes_in = out.summary.bytes_in + e.size;
     Result.Ok(0)
+}
+
+fn stream_into(out: Out, s: Source, e: Entry, o: Options, src: int) -> Result<int, string> {
+    var chunk = match (fs.read_bytes(src, CHUNK)) {
+        Result.Ok(Option.Some(c)) => c,
+        Result.Ok(Option.None) => b"",
+        Result.Err(m) => return Result.Err("${s.path}: ${m}"),
+    };
+    var packed = if (o.store_only) { chunk } else { deflate.deflate_raw_chunk(chunk, LEVEL) };
+    let deflating = packed.len() < chunk.len();
+    if (!deflating) {
+        packed = chunk;
+    }
+    e.method = if (deflating) { format.DEFLATED } else { format.STORED };
+    // The header goes first with the size read at the walk; for a deflated entry the compressed
+    // size is a placeholder of the same width.
+    e.compressed = s.size;
+    let header_at = out.offset;
+    put(out, format.local_header(e))?;
+    var sum = 0;
+    var copied = 0;
+    var written = 0;
+    while (chunk.len() > 0) {
+        sum = inflate.crc32_update(sum, chunk);
+        copied = copied + chunk.len();
+        put(out, packed)?;
+        written = written + packed.len();
+        chunk = match (fs.read_bytes(src, CHUNK)) {
+            Result.Ok(Option.Some(c)) => c,
+            Result.Ok(Option.None) => b"",
+            Result.Err(m) => return Result.Err("${s.path}: ${m}"),
+        };
+        packed = if (deflating) { deflate.deflate_raw_chunk(chunk, LEVEL) } else { chunk };
+    }
+    if (deflating) {
+        // The final block, empty, closes the stream.
+        let last = deflate.deflate_raw_level(b"", LEVEL);
+        put(out, last)?;
+        written = written + last.len();
+    }
+    if (copied != s.size) {
+        return Result.Err("${s.path}: changed while being read (${copied} bytes, not ${s.size})");
+    }
+    if (written >= format.MAX32 && s.size < format.MAX32) {
+        // The header has no room for it: only a file just under 4 GiB that barely compresses.
+        return Result.Err("${s.path}: deflated past 4 GiB; store it (-0)");
+    }
+    e.crc = sum;
+    e.compressed = written;
+    patch_header(out, header_at, e, deflating)
+}
+
+/// A symlink stored as a link: its data is the target text.
+fn add_link(out: Out, s: Source, e: Entry) -> Result<int, string> {
+    let target = s.link.to_bytes();
+    e.crc = inflate.crc32(target);
+    e.size = target.len();
+    e.compressed = target.len();
+    add(out, e, target)
 }
 
 fn add_packed(out: Out, s: Source, p: Packed, o: Options) -> Result<int, string> {
@@ -269,10 +327,13 @@ fn add_one(out: Out, s: Source, o: Options) -> Result<int, string> {
         e.size = 0;
         return add(out, e, b"");
     }
+    if (s.link != "") {
+        return add_link(out, s, e);
+    }
     if (deflatable(s, o)) {
         return add_packed(out, s, pack(0, s.path, o.store_only), o);
     }
-    add_streamed(out, s, e)
+    add_streamed(out, s, e, o)
 }
 
 fn write_sequential(

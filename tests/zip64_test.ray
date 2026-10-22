@@ -20,7 +20,8 @@ fn seventy_thousand_entries() {
                 is_dir: false,
                 size: 1,
                 mtime_ms: 1760000000000,
-                perm: 0o644
+                perm: 0o644,
+                link: ""
             }
         );
     }

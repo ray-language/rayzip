@@ -93,6 +93,10 @@ pub fn file_mode(perm: int) -> int {
     S_IFREG | perm
 }
 
+pub fn link_mode(perm: int) -> int {
+    S_IFLNK | perm
+}
+
 fn needs_zip64(e: Entry) -> bool {
     e.size >= MAX32 || e.compressed >= MAX32
 }

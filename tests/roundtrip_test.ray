@@ -158,6 +158,11 @@ fn extraction_restores_contents_and_modes() {
     assert_eq(fs.read_file_bytes("${base}/sub/noise.bin").unwrap(), noise(70000, 7));
     assert_eq(fs.read_file("${base}/sub/deep/ñandú.txt").unwrap(), "ñandú\n");
     assert_eq(fs.read_file("${base}/empty").unwrap(), "");
+    // Times come back (to the second, as the archive keeps them).
+    let st = fs.stat("${root}/in/a.txt").unwrap();
+    assert_eq(fs.stat("${base}/a.txt").unwrap().mtime_ms, st.mtime_ms / 1000 * 1000);
+    let sd = fs.stat("${root}/in/sub").unwrap();
+    assert_eq(fs.stat("${base}/sub").unwrap().mtime_ms, sd.mtime_ms / 1000 * 1000);
     if (unix()) {
         assert_eq(fs.stat("${base}/a.txt").unwrap().mode & 0o777, 0o640);
     }
@@ -171,17 +176,37 @@ fn extraction_restores_contents_and_modes() {
 @test
 fn big_entries_take_the_streaming_paths() {
     let root = tree();
-    // Over the deflate limit: stored in chunks with the CRC patched in afterwards.
+    // Over the deflate limit, in chunks, with the CRC and size patched in afterwards: text is
+    // deflated (one stream of `deflate_raw_chunk`s), noise stored.
     let o = options(1);
     o.deflate_limit = 1000;
     let path = build(root, o);
     let a = archive.open(path).unwrap();
     let text = a.entries.filter(fn(e: format.Entry) -> bool { e.name.ends_with("a.txt") })[0];
-    assert_eq(text.method, format.STORED);
+    assert_eq(text.method, format.DEFLATED);
+    assert(text.compressed * 10 < text.size);
+    let noisy = a.entries.filter(fn(e: format.Entry) -> bool { e.name.ends_with("noise.bin") })[0];
+    assert_eq(noisy.method, format.STORED);
     let z = zip.open(fs.read_file_bytes(path).unwrap()).unwrap();
     assert_eq(zip.read(z, text.name).unwrap(), text_block(50000).to_bytes());
+    assert_eq(zip.read(z, noisy.name).unwrap(), noise(70000, 7));
+    assert_eq(extract.test(a, quiet).failed.len(), 0);
     archive.close_archive(a);
     fs.remove_file(path).unwrap();
+    // Several chunks (the writer reads 1 MiB at a time).
+    let big = text_block(3 * 1024 * 1024);
+    fs.write_file("${root}/in/big.txt", big).unwrap();
+    let path3 = build(root, o);
+    let c = archive.open(path3).unwrap();
+    let be = c.entries.filter(fn(e: format.Entry) -> bool { e.name.ends_with("big.txt") })[0];
+    assert_eq(be.method, format.DEFLATED);
+    assert_eq(
+        zip.read(zip.open(fs.read_file_bytes(path3).unwrap()).unwrap(), be.name).unwrap(),
+        big.to_bytes()
+    );
+    archive.close_archive(c);
+    fs.remove_file(path3).unwrap();
+    fs.remove_file("${root}/in/big.txt").unwrap();
     // A deflated entry read through the streaming inflater instead of in one call.
     let path2 = build(root, options(1));
     let b = archive.open(path2).unwrap();
@@ -228,5 +253,41 @@ fn the_archive_never_goes_into_itself() {
     let list = sources.collect(["${root}/in"], fs.real_path(path).unwrap()).unwrap();
     let inside = list.filter(fn(s: sources.Source) -> bool { s.name.ends_with("self.zip") });
     assert_eq(inside.len(), 0);
+    fs.remove_all(root).unwrap();
+}
+
+@test
+fn with_links_a_symlink_is_stored_as_one() {
+    let root = tree();
+    fs.symlink("sub/deep/ñandú.txt", "${root}/in/link").unwrap();
+    fs.symlink("nowhere", "${root}/in/dangling").unwrap();
+    // Followed by default (the dangling one has nothing to store)...
+    let followed = sources.collect(["${root}/in"], "").unwrap();
+    let fl = followed.filter(fn(s: sources.Source) -> bool { s.name.ends_with("/link") })[0];
+    assert_eq(fl.link, "");
+    assert_eq(fl.size, "ñandú\n".to_bytes().len());
+    assert_eq(
+        followed.filter(fn(s: sources.Source) -> bool { s.name.ends_with("dangling") }).len(),
+        0
+    );
+    // ...and kept as links with -y, dangling or not, with `/` on every system.
+    let list = sources.collect_with(["${root}/in"], "", true).unwrap();
+    let path = "${root}/links.zip";
+    create.create(path, list, options(2), quiet).unwrap();
+    let a = archive.open(path).unwrap();
+    let le = a.entries.filter(fn(e: format.Entry) -> bool { e.name.ends_with("/link") })[0];
+    assert(format.is_symlink(le));
+    assert_eq(
+        zip.read(zip.open(fs.read_file_bytes(path).unwrap()).unwrap(), le.name).unwrap(),
+        b"sub/deep/\xc3\xb1and\xc3\xba.txt"
+    );
+    let dest = "${root}/x";
+    let s = extract.extract(a, extract.Options { dest: dest, overwrite: false }, quiet).unwrap();
+    assert_eq(s.links, 2);
+    let base = "${dest}/${sources.archive_name(root)}/in";
+    assert_eq(fs.stat("${base}/link").unwrap().kind, "symlink");
+    assert_eq(fs.read_file("${base}/link").unwrap(), "ñandú\n");
+    assert_eq(fs.stat("${base}/dangling").unwrap().kind, "symlink");
+    archive.close_archive(a);
     fs.remove_all(root).unwrap();
 }

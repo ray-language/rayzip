@@ -13,6 +13,8 @@ pub struct Source {
     mtime_ms: int,
     /// Permission bits (st_mode & 0o777).
     perm: int,
+    /// A symlink stored as a link: the text it points to, with `/` separators. Empty otherwise.
+    link: string,
 }
 
 /// The archive name of a path as typed: no drive letter, no leading `/` or `./`, no `.` or `..`
@@ -29,16 +31,23 @@ pub fn archive_name(path: string) -> string {
 }
 
 /// Walks the inputs in order, directories depth-first with their entries sorted. Symlinks are
-/// followed (as `zip` does without `-y`; there is no way to read a link's target text);
-/// `skip` is the real path of the archive being written, so it never goes into itself.
+/// followed (as `zip` does without `-y`); `skip` is the real path of the archive being written,
+/// so it never goes into itself.
 pub fn collect(inputs: [string], skip: string) -> Result<[Source], string> {
+    collect_with(inputs, skip, false)
+}
+
+/// The same walk; with `links`, a symlink is stored as a link (its target text), not followed
+/// (`zip -y`).
+pub fn collect_with(inputs: [string], skip: string, links: bool) -> Result<[Source], string> {
     let out: [Source] = [];
     let seen: Map<string, bool> = Map.new();
     for input in inputs {
-        if (!fs.exists(input)) {
+        // A dangling symlink is still something to store as a link.
+        if (!fs.exists(input) && !(links && fs.stat(input).is_ok())) {
             return Result.Err("${input}: no such file or directory");
         }
-        walk(input, archive_name(input), skip, seen, out)?;
+        walk(input, archive_name(input), skip, links, seen, out)?;
     }
     Result.Ok(out)
 }
@@ -47,10 +56,38 @@ fn walk(
     path: string,
     name: string,
     skip: string,
+    links: bool,
     seen: Map<string, bool>,
     out: [Source]
 ) -> Result<int, string> {
-    let real = fs.real_path(path)?;
+    if (links) {
+        let st = fs.stat(path)?;
+        if (st.kind == "symlink") {
+            // Windows gives the target back with `\`; an archive always uses `/`.
+            let target = fs.read_link(path)?.replace("\\", "/");
+            out.push(
+                Source {
+                    path: path,
+                    name: name,
+                    is_dir: false,
+                    size: target.to_bytes().len(),
+                    mtime_ms: st.mtime_ms,
+                    perm: st.mode & 0o777,
+                    link: target
+                }
+            );
+            return Result.Ok(0);
+        }
+    }
+    let real = match (fs.real_path(path)) {
+        Result.Ok(r) => r,
+        // A dangling symlink: nothing to follow, nothing to store (as `zip` does).
+        Result.Err(m) => if (fs.stat(path).map(fn(s: fs.Stat) -> bool { s.kind == "symlink" }).unwrap_or(false)) {
+            return Result.Ok(0);
+        } else {
+            return Result.Err("${path}: ${m}");
+        },
+    };
     if (real == skip) {
         return Result.Ok(0);
     }
@@ -69,18 +106,19 @@ fn walk(
                     is_dir: true,
                     size: 0,
                     mtime_ms: st.mtime_ms,
-                    perm: st.mode & 0o777
+                    perm: st.mode & 0o777,
+                    link: ""
                 }
             );
         }
         for child in fs.list_dir(path)? {
             let child_name = if (name == "") { child } else { "${name}/${child}" };
-            walk("${path}/${child}", child_name, skip, seen, out)?;
+            walk("${path}/${child}", child_name, skip, links, seen, out)?;
         }
         return Result.Ok(0);
     }
     if (!fs.is_file(path)) {
-        // A dangling symlink, a socket, a device: nothing to store.
+        // A socket, a device: nothing to store.
         return Result.Ok(0);
     }
     let st = fs.stat(real)?;
@@ -91,7 +129,8 @@ fn walk(
             is_dir: false,
             size: st.size,
             mtime_ms: st.mtime_ms,
-            perm: st.mode & 0o777
+            perm: st.mode & 0o777,
+            link: ""
         }
     );
     Result.Ok(0)
