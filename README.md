@@ -82,20 +82,20 @@ make bench         # contra zip/unzip/gzip en un corpus generado
 
 ## Rendimiento
 
-`make bench` en un MacBook (Apple Silicon, 10 núcleos), binario nativo de raylang 1.27.75, frente a
+`make bench` en un MacBook (Apple Silicon, 10 núcleos), binario nativo de raylang 1.27.76, frente a
 `zip` 3.0, `unzip` 6.00 y `gzip` de macOS. Corpus de texto (una lista de palabras, ~3,3:1):
 
 | Qué | rayzip | herramienta del sistema |
 |---|---:|---:|
-| 25 archivos de 1 MB, `c -j 1` | 1,09 s · 12 MB | `zip -r` 0,87 s · 1 MB |
-| ídem, `-j 4` / `-j 8` | 0,24 s / 0,16 s · 45 MB | |
-| 256 MiB, `c` (por trozos) | 8,3 s · 11 MB | `zip` 9,4 s · 1 MB |
-| 256 MiB, `c --max-deflate 1G` (entero en memoria) | 8,5 s · 611 MB | |
+| 25 archivos de 1 MB, `c -j 1` | 1,12 s · 12 MB | `zip -r` 0,87 s · 1 MB |
+| ídem, `-j 4` / `-j 8` | 0,24 s · 30 MB / 0,15 s · 37 MB | |
+| 256 MiB, `c` (por trozos) | 8,2 s · 11 MB | `zip` 9,4 s · 1 MB |
+| 256 MiB, `c --max-deflate 1G` (entero en memoria) | 8,4 s · 598 MB | |
 | 256 MiB, `c -0` (sin comprimir) | 0,67 s · 10 MB | |
-| 256 MiB, `t` (80 MB comprimidos: streaming) | 1,25 s · 23 MB | `unzip -t` 1,4 s · 2 MB |
-| 256 MiB, `gzip` (10 fibras) | 1,3 s · 214 MB | `gzip` 9,2 s · 1 MB |
+| 256 MiB, `t` (80 MB comprimidos: streaming) | 1,24 s · 23 MB | `unzip -t` 1,4 s · 2 MB |
+| 256 MiB, `gzip` (10 fibras) | 1,3 s · 208 MB | `gzip` 9,1 s · 1 MB |
 | 256 MiB, `gunzip` de rayzip (miembros) | 1,4 s · 24 MB | `gzip -d` 0,35 s · 1 MB |
-| 256 MiB, `gunzip` de `gzip` (un miembro) | 1,5 s · 23 MB | |
+| 256 MiB, `gunzip` de `gzip` (un miembro) | 1,4 s · 23 MB | |
 
 El tamaño comprimido es el de `zip`/`gzip` ±0,3 % (81,4 MB frente a 81,2 MB); por trozos de 1 MiB
 cuesta 20 KB más que de una vez. Comprimir en paralelo escala casi lineal hasta 4 fibras. Con raylang
@@ -106,7 +106,7 @@ en raylang (#189); desde 1.27.75 va por el runtime.
 
 | Qué | Estado |
 |---|---|
-| Crear, listar, probar, extraer; gzip y gunzip | **37 tests** en VM y nativo (raylang 1.27.75) en macOS, Linux y Windows 11 ARM64, con `std/zip` de oráculo |
+| Crear, listar, probar, extraer; gzip y gunzip | **37 tests** en VM y nativo (raylang 1.27.76) en macOS, Linux y Windows 11 ARM64, con `std/zip` de oráculo |
 | Entradas grandes | 100 MB de texto: `c` en 2 s con 14 MB de memoria, `unzip -t` lo da por bueno, `x` lo devuelve igual (`cmp`). Con raylang 1.27.73 las de más de 64 MiB comprimidos fallaban (#223) |
 | Compatibilidad | `unzip -t`/`unzip` leen lo que escribe (contenido, modos, ZIP64 de 66 000 entradas); rayzip lee lo de `zip -r`, `zip -ry` (symlinks) y `zip -r0`; `gzip -t`/`-d` leen sus miembros y rayzip los `.gz` de `gzip` |
 | Seguridad al extraer | zip-slip (`..`, absolutos, unidades, `\`), symlinks fuera, symlinks plantados, bombas, setuid, archivos truncados: tests en `tests/safety_test.ray` |
@@ -119,8 +119,9 @@ y cifrado.
 
 ## Hallazgos de dogfood
 
-En `findings/` del directorio de las apps: `open/rayzip-1.27.65.md` (#188–#200),
-`closed/2026-10/rayzip-1.27.73.md` (#223–#225), y las re-mediciones con raylang 1.27.73 y 1.27.75:
+En `findings/` del directorio de las apps: `closed/2026-10/rayzip-1.27.65.md` (#188–#200),
+`closed/2026-10/rayzip-1.27.73.md` (#223–#225), y las re-mediciones con raylang 1.27.73, 1.27.75 y
+1.27.76. Están todos cerrados:
 
 1. **#188 [B]** ✅ `inflate.gunzip` daba «CRC32 mismatch (corrupt gzip)» con un gzip válido de varios
    miembros (el de rayzip, o dos `gzip_compress` concatenados).
@@ -138,8 +139,8 @@ En `findings/` del directorio de las apps: `open/rayzip-1.27.65.md` (#188–#200
 9. **#196 [D]** ✅ `llms.txt` listaba `std/huffman` sin decir que es solo HPACK.
 10. **#197 [B]** ✅ `worker_count()`/`worker_id()` no compilaban en nativo para Windows arm64.
 11. **#198 [B]** ✅ `fs.symlink` en Windows con `/` en el destino creaba un enlace que no se seguía.
-12. **#199 [D]** ⚠️ `fs.chmod` es `Err` en Windows y `Stat.mode` vale 0; la doc de `chmod` ya lo dice,
-    la de `Stat` no.
+12. **#199 [D]** ✅ `fs.chmod` es `Err` en Windows y `Stat.mode` vale 0; la doc no lo decía. La de
+    `chmod` lo dice desde 1.27.75, y la de `Stat` y `stat` desde 1.27.76.
 13. **#200 [E]** ✅ No había hora local en Windows: ni `tz` ni `std/time`.
 14. **#223 [B]** ✅ Con 1.27.73, `inflate.stream_push` perdía datos en cuanto el stream llegaba en más
     de un trozo: las entradas grandes salían como corruptas. Arreglado en 1.27.75.
