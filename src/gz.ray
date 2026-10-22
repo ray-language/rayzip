@@ -9,7 +9,6 @@ import std/deflate;
 import std/fs;
 import std/inflate;
 import archive;
-import crc;
 import le;
 
 pub const MEMBER: int = 4 * 1024 * 1024;
@@ -350,7 +349,7 @@ fn single(input: int, body_at: int, size: int, out: int) -> Result<int, string> 
         }
     }
     let z = inflate.inflate_stream();
-    let sum = crc.new();
+    var sum = 0;
     var read = 0;
     var produced = 0;
     fs.seek(input, body_at)?;
@@ -363,7 +362,7 @@ fn single(input: int, body_at: int, size: int, out: int) -> Result<int, string> 
         read = read + chunk.len();
         let data = inflate.stream_push(z, chunk)?;
         if (data.len() > 0) {
-            crc.update(sum, data);
+            sum = inflate.crc32_update(sum, data);
             fs.write_bytes(out, data)?;
             produced = produced + data.len();
         }
@@ -371,6 +370,6 @@ fn single(input: int, body_at: int, size: int, out: int) -> Result<int, string> 
     if (!inflate.stream_finished(z)) {
         return Result.Err("truncated deflate stream");
     }
-    check_trailer(trailer, sum.value, produced)?;
+    check_trailer(trailer, sum, produced)?;
     Result.Ok(produced)
 }

@@ -3,6 +3,6 @@
 
 [tz]
 url = "https://github.com/ray-language/tz"
-ref = "v0.1.0"
-commit = "ab01fddd500a6fc21a287522eb8ed0b67aca4c38"
-hash = "sha256:ac284d8cb8fc6851434dd626344bee15d8bba3aeb26f01299af3b734aa793354"
+ref = "v0.2.0"
+commit = "3e6481972f8fb9114e20a4964c85fa3a73326e5e"
+hash = "sha256:17ff0148f1e0e41fcb99149cc2a4fdb0abbebb84c70fbd099a788f8abae1a159"

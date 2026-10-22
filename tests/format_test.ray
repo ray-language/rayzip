@@ -2,6 +2,7 @@
 
 import std/collections/bytesbuilder;
 import std/inflate;
+import std/time;
 import dostime;
 import format;
 import le;
@@ -156,8 +157,19 @@ fn dos_time_round_trips_at_two_second_resolution() {
 }
 
 @test
+fn the_system_clock_is_the_os_local_time() {
+    // Everywhere, Windows included: the offset the OS gives for an instant.
+    let c = dostime.system();
+    let ms = 1782907200000;
+    let (t, _) = dostime.encode(c, ms);
+    let local = time.from_epoch_millis(ms + time.local_offset_ms(ms));
+    assert_eq(t >> 11, local.hour);
+    assert_eq((t >> 5) & 63, local.minute);
+}
+
+@test
 fn dos_time_is_local_time() {
-    // The tz package reads the system's zoneinfo database, which Windows does not have.
+    // A named zone needs the zoneinfo database, which Windows does not have.
     if (platform() == "windows") {
         assert(dostime.zone("Europe/Madrid").is_err());
         eprint("skipped: no zoneinfo database on Windows");

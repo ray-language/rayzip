@@ -1,5 +1,6 @@
 //! MS-DOS date and time, the ZIP header's timestamp: local time, two-second resolution, years
-//! 1980–2107. The zone comes from the `tz` package (the system's zone); without one, UTC.
+//! 1980–2107. The zone comes from the `tz` package: the system's, also on Windows, where tz falls
+//! back to the operating system's rules.
 
 import std/time;
 import tz/tz;
@@ -9,7 +10,7 @@ pub struct Clock {
     zone: Option<tz.Zone>,
 }
 
-/// The system's zone, or UTC if it cannot be read (no `/etc/localtime`, no `TZ`).
+/// The system's zone (`TZ`, `/etc/localtime`, or the OS's own rules), or UTC if even that fails.
 pub fn system() -> Clock {
     Clock { zone: tz.system().ok() }
 }

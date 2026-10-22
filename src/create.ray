@@ -7,7 +7,6 @@ import std/collections/bytesbuilder;
 import std/deflate;
 import std/fs;
 import std/inflate;
-import crc;
 import dostime;
 import format;
 import sources;
@@ -164,13 +163,13 @@ fn add_streamed(out: Out, s: Source, e: Entry) -> Result<int, string> {
     let header_at = out.offset;
     put(out, format.local_header(e))?;
     let src = fs.open(s.path, "r")?;
-    let sum = crc.new();
+    var sum = 0;
     var copied = 0;
     var failed = "";
     while (failed == "") {
         match (fs.read_bytes(src, CHUNK)) {
             Result.Ok(Option.Some(chunk)) => {
-                crc.update(sum, chunk);
+                sum = inflate.crc32_update(sum, chunk);
                 copied = copied + chunk.len();
                 match (put(out, chunk)) {
                     Result.Ok(_) => { },
@@ -188,7 +187,7 @@ fn add_streamed(out: Out, s: Source, e: Entry) -> Result<int, string> {
     if (copied != s.size) {
         return Result.Err("${s.path}: changed while being read (${copied} bytes, not ${s.size})");
     }
-    e.crc = sum.value;
+    e.crc = sum;
     let end = out.offset;
     fs.seek(out.h, header_at + 14)?;
     let patch = bytesbuilder.new();

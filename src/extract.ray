@@ -147,10 +147,7 @@ pub fn extract(a: Archive, o: Options, progress: fn(string)) -> Result<Summary, 
                     "${e.name}: symlink to '${target}' leads outside the destination"
                 );
             }
-            // Windows resolves a link's target only with its own separator (a `/` target is
-            // created but cannot be followed); archives always store `/`.
-            let native = if (platform() == "windows") { target.replace("/", "\\") } else { target };
-            fs.symlink(native, path)?;
+            fs.symlink(target, path)?;
             sum.links = sum.links + 1;
             continue;
         }

@@ -5,7 +5,6 @@
 import std/collections/bytesbuilder;
 import std/fs;
 import std/inflate;
-import crc;
 import format;
 from format import Entry;
 
@@ -132,7 +131,7 @@ fn stream_entry(
     data_at: int,
     sink: fn(bytes) -> Result<int, string>
 ) -> Result<int, string> {
-    let sum = crc.new();
+    var sum = 0;
     let z = inflate.inflate_stream();
     inflate.stream_set_limit(z, e.size);
     var read = 0;
@@ -155,7 +154,7 @@ fn stream_entry(
             if (produced > e.size) {
                 return Result.Err("${e.name}: more data than the declared ${e.size} bytes");
             }
-            crc.update(sum, out);
+            sum = inflate.crc32_update(sum, out);
             sink(out)?;
         }
     }
@@ -165,7 +164,7 @@ fn stream_entry(
     if (produced != e.size) {
         return Result.Err("${e.name}: size ${produced} instead of ${e.size}");
     }
-    if (sum.value != e.crc) {
+    if (sum != e.crc) {
         return Result.Err("${e.name}: CRC-32 mismatch");
     }
     Result.Ok(produced)
